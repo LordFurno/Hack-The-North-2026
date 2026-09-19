@@ -1,0 +1,41 @@
+{
+  "schema_version": "yibu_usage_summary_v1",
+  "generated_at_utc": "2026-09-19T14:54:19.243662+00:00",
+  "source": {
+    "path": "C:\\Users\\lordf\\Downloads\\Hack-The-North-2026\\yibuapi_examples_20260918_v01\\artifacts\\yibu_api_calls.jsonl",
+    "bytes": 1450,
+    "sha256": "94eae5b1f240123d3cddb88cdf6f60ce8aba82ade6adfe26c107202d6bb47ff6",
+    "unique_call_ids": 2,
+    "duplicate_rows_ignored": 0
+  },
+  "accounting_note": "Missing token values are unknown, not zero; totals only sum reported values.",
+  "totals": {
+    "calls": 2,
+    "ok": 2,
+    "failed": 0,
+    "usage_missing_calls": 0,
+    "input_tokens": 4464,
+    "output_tokens": 458,
+    "total_tokens": 4922,
+    "input_tokens_missing_calls": 0,
+    "output_tokens_missing_calls": 0,
+    "total_tokens_missing_calls": 0
+  },
+  "groups": [
+    {
+      "model": "qwen3.5-omni-plus",
+      "key_suffix": "...0brU",
+      "purpose": "object_detection_max5",
+      "calls": 2,
+      "ok": 2,
+      "failed": 0,
+      "usage_missing_calls": 0,
+      "input_tokens": 4464,
+      "output_tokens": 458,
+      "total_tokens": 4922,
+      "input_tokens_missing_calls": 0,
+      "output_tokens_missing_calls": 0,
+      "total_tokens_missing_calls": 0
+    }
+  ]
+}
