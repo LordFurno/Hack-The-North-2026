@@ -14,8 +14,10 @@ Flat, at repo root. No packages, no src/ dir.
   identity.py  embedder, matcher, exemplar bank
   agent.py     AgentTracker
   omni.py      async labelling (label + isContainer), one call per new entity
+  voice.py     wake phrase -> world state as context -> Omni -> spoken answer
   fake.py      scripted observation generator
   synth.py     synthetic fixture video renderer
+  start.py     the access point: calibrate, then service + camera + voice
   calibrate.py one-off: clicked corners + empty-desk reference -> calib.json
   live.py      camera -> perceive.run -> POST /observation (or --local)
   replay.py    run the pipeline over a video file, annotated JPEG per settle

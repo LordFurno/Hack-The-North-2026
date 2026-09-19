@@ -11,7 +11,7 @@ TARGET_PHRASE = "test test"  # <-- CHANGE THIS to your specific phrase (lowercas
 RATE = 16000
 CHUNK = 1024
 SILENCE_LIMIT = 1.2         # Seconds of silence before finalizing a phrase
-LOUDNESS_THRESHOLD = 300    # Mic sensitivity (lower = more sensitive)
+LOUDNESS_THRESHOLD = 400    # Mic sensitivity (lower = more sensitive)
 
 print("Loading Whisper model...")
 model = WhisperModel("base.en", device="cpu", compute_type="float32")

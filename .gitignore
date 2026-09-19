@@ -9,6 +9,7 @@ venv/
 calib.json
 reference.png
 
-# Run output: keyframes, crops and annotated replays
+# Run output: keyframes, crops, annotated replays, and the last spoken turn
 snaps/
 replay/
+voice/
