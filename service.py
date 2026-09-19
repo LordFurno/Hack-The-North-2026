@@ -6,8 +6,9 @@ from resolve import settle
 import fake
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 import numpy as np
-import argparse, asyncio, re, threading, time
+import argparse, asyncio, os, re, threading, time
 import uvicorn
 
 #Perception is the only writer, everything else reads. Phrasing is the model's job,
@@ -15,6 +16,7 @@ import uvicorn
 
 HISTORY_LIMIT = 20
 STREAM_HZ = 5.0 #State is small enough to re-send whole, so decay is watchable
+UI_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
 
 PREP = {Relation.IN: "in", Relation.UNDER: "under",
         Relation.ON: "on", Relation.HELD: "held by"}
@@ -141,6 +143,18 @@ def stateJson(world: World, now: float) -> dict:
             "entities": [entityJson(world, e, now) for e in world.entities.values()]}
 
 
+def streamJson(world: World, now: float, since: int) -> dict:
+    #Whole state plus the events the client has not had yet. Confidence decays
+    #between settles, so a client that only listened for events would watch a
+    #frozen scene. `seq` is the event's index in the log: it survives a reconnect,
+    #which resends the tail, and lets the page drop what it has already drawn.
+    payload = stateJson(world, now)
+    payload["events"] = [dict(eventJson(world, ev), seq=i)
+                         for i, ev in enumerate(world.events[since:], since)]
+    payload["seq"] = len(world.events)
+    return payload
+
+
 # ---- tools --------------------------------------------------------------
 
 def whereIs(world: World, query: str) -> dict:
@@ -215,6 +229,12 @@ def postObservation(payload: dict):
 
 # ---- read ---------------------------------------------------------------
 
+@app.get("/")
+def getPage():
+    #One static page, no framework. It reads the same stream any other client would.
+    return FileResponse(UI_PAGE, media_type="text/html")
+
+
 @app.get("/state")
 def getState():
     with LOCK:
@@ -230,20 +250,18 @@ def getEvents(since: float = 0.0):
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
-    #Whole state plus the new events, on a tick. Confidence decays between settles,
-    #so a client that only listened for events would show a frozen scene.
+    #Push, on a tick. A client that connects late gets the whole event log first.
     await ws.accept()
     sent = 0
     try:
         while True:
             with LOCK:
-                payload = stateJson(WORLD, time.time())
-                payload["events"] = [eventJson(WORLD, ev) for ev in WORLD.events[sent:]]
-                sent = len(WORLD.events)
+                payload = streamJson(WORLD, time.time(), sent)
+                sent = payload["seq"]
             await ws.send_json(payload)
             await asyncio.sleep(1.0 / STREAM_HZ)
-    except WebSocketDisconnect:
-        return
+    except (WebSocketDisconnect, RuntimeError):
+        return #The page reconnects on its own, and a closed socket is not an error
 
 
 @app.get("/tools/where_is")

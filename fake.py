@@ -83,10 +83,12 @@ def scriptObservations(desk: FakeDesk = None) -> list[Observation]:
 
 def stream(speed: float = 1.0):
     #The same script on a timer, for anything downstream that wants a live feed.
+    #Script time is stamped onto the wall clock here: decay measures time since the
+    #world last agreed with the model, and 1970 is a long time to have not agreed.
     desk = FakeDesk()
     start = time.time()
     for row in SCRIPT:
         wait = row[0] / speed - (time.time() - start)
         if wait > 0:
             time.sleep(wait)
-        yield desk.step(*row)
+        yield desk.step(start + row[0] / speed, *row[1:])

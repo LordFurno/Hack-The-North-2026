@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spatial memory</title>
+<style>
+:root {
+  --bg:     #0b0e11;
+  --panel:  #12171c;
+  --line:   #222a33;
+  --ink:    #e6edf3;
+  --dim:    #8b98a5;
+  --faint:  #5b6976;
+  --mat:    #15291f;   /* the physical mat is saturated green; echo it */
+  --vis:    #4ade80;
+  --hid:    #a78bfa;
+  --unres:  #fbbf24;
+  --off:    #7c8b9a;
+  --bad:    #f87171;
+  --mono:   ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* ---- header ---------------------------------------------------------- */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.pill.hidden { display: none; }
+
+.dot-link {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bad);
+}
+
+.live .dot-link { background: var(--vis); }
+.pill.hand { color: var(--unres); border-color: #4a3d16; }
+.spacer { flex: 1; }
+
+/* ---- panes ----------------------------------------------------------- */
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr minmax(320px, 400px);
+  min-height: 0;
+}
+
+section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+#timeline-pane { border-left: 1px solid var(--line); background: var(--panel); }
+
+.pane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.pane-head b { color: var(--faint); font-weight: 400; }
+
+/* ---- map ------------------------------------------------------------- */
+
+.map-body {
+  flex: 1;
+  display: flex;
+  gap: 12px;
+  padding: 16px;
+  min-height: 0;
+}
+
+.mat-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+
+#mat { width: 100%; height: 100%; }
+
+.grid  { stroke: #ffffff12; stroke-width: 1; }
+.third { stroke: #ffffff1a; stroke-width: 1; stroke-dasharray: 4 6; }
+.edge  { fill: var(--mat); stroke: #2f5c46; stroke-width: 2; }
+
+.fp  { stroke-width: 2; vector-effect: non-scaling-stroke; }
+.vis   .fp { fill: #4ade8026; stroke: var(--vis); }
+.hid   .fp { fill: none; stroke: var(--hid); stroke-dasharray: 7 5; }
+.unres .fp { fill: none; stroke: var(--unres); stroke-dasharray: 3 5; }
+
+.dot { fill: var(--vis); }
+
+.tag {
+  font-family: var(--mono);
+  font-size: 15px;
+  fill: var(--ink);
+  text-anchor: middle;
+}
+
+.tag.nested { font-size: 13px; }
+.hid   .tag { fill: #c9b8fd; }
+.unres .tag { fill: #fcd77a; }
+
+.qmark {
+  font: 600 30px var(--mono);
+  fill: var(--unres);
+  text-anchor: middle;
+}
+
+/* ---- margin strip ---------------------------------------------------- */
+
+.strip {
+  width: 148px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 12px;
+  border-left: 1px dashed var(--line);
+  overflow-y: auto;
+}
+
+.strip-head {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.strip-head + .strip-head { margin-top: 8px; }
+
+.chip {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--off);
+  border-radius: 3px;
+  background: #ffffff06;
+  filter: grayscale(0.7);
+}
+
+.chip.held { border-left-color: var(--hid); border-style: dashed; filter: none; }
+.chip b { display: block; font-weight: 500; color: var(--dim); }
+.chip.held b { color: #c9b8fd; }
+
+.chip span {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.empty { color: var(--faint); font-size: 11px; font-style: italic; }
+
+/* ---- timeline -------------------------------------------------------- */
+
+#timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.row {
+  padding: 8px 16px;
+  border-bottom: 1px solid #ffffff08;
+  border-left: 2px solid transparent;
+}
+
+.row.fresh { animation: flash 1.2s ease-out; }
+
+@keyframes flash {
+  from { background: #ffffff14; }
+  to   { background: transparent; }
+}
+
+.row-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.row-head .at    { color: var(--faint); }
+.row-head .kind  { letter-spacing: 0.06em; }
+.row-head .who   { color: var(--dim); }
+.row-head .conf  { margin-left: auto; color: var(--faint); }
+
+.note  { margin-top: 3px; }
+.cause { margin-top: 2px; color: var(--dim); font-family: var(--mono); font-size: 11px; }
+.alts  { margin-top: 2px; color: var(--faint); font-size: 11px; font-style: italic; }
+
+/* Every kind gets a colour, so the shape of a run is readable at a glance. */
+.k-APPEARED         { color: var(--vis); }
+.k-MOVED,
+.k-PUT_DOWN         { color: #60a5fa; }
+.k-COVERED          { color: var(--hid); }
+.k-REVEALED,
+.k-CONFIRMED        { color: #2dd4bf; }
+.k-PICKED_UP,
+.k-LEFT_DESK        { color: var(--unres); }
+.k-LOST             { color: var(--off); }
+.k-BELIEF_FALSIFIED { color: var(--bad); }
+
+/* A system that announces its own errors reads as more sophisticated than one
+   that is silently right, so the falsification is the loudest row on the page. */
+.row.falsified {
+  border-left-color: var(--bad);
+  background: #f871711a;
+}
+
+.row.falsified .note { color: #fca5a5; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>spatial memory</h1>
+  <div class="pill" id="link"><i class="dot-link"></i><span>offline</span></div>
+  <div class="pill" id="count">0 entities</div>
+  <div class="pill hand hidden" id="hand">hand in frame</div>
+  <div class="spacer"></div>
+  <div class="pill" id="clock">&mdash;</div>
+</header>
+
+<main>
+  <section id="map-pane">
+    <div class="pane-head">desk <b id="dims"></b></div>
+    <div class="map-body">
+      <div class="mat-wrap"><svg id="mat" preserveAspectRatio="xMidYMid meet"></svg></div>
+      <aside class="strip" id="strip"></aside>
+    </div>
+  </section>
+
+  <section id="timeline-pane">
+    <div class="pane-head">events <b id="events-note">newest first</b></div>
+    <div id="timeline"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const MIN_MM      = 22;    // a footprint-less entity still has to be visible
+const NEST_PAD    = 11;    // mm of inset per nesting level
+const MIN_OPACITY = 0.12;  // an entity is never deleted, so it never fades to nothing
+const MAX_ROWS    = 300;
+const RETRY_MS    = 1500;
+
+const matEl    = document.getElementById("mat");
+const stripEl  = document.getElementById("strip");
+const timeline = document.getElementById("timeline");
+const linkEl   = document.getElementById("link");
+const handEl   = document.getElementById("hand");
+
+const seen = new Set();    // event seq numbers, so a reconnect does not duplicate rows
+
+// ---- helpers ------------------------------------------------------------
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const clamp = (v, lo, hi) => lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, v));
+
+function stamp(ts) {
+  // The fake script can run on its own clock, so only format real epochs as a time.
+  if (ts < 1e9) return "t+" + ts.toFixed(1) + "s";
+  return new Date(ts * 1000).toTimeString().slice(0, 8);
+}
+
+function ownRect(e) {
+  const w = Math.max(e.footprint[0], MIN_MM), h = Math.max(e.footprint[1], MIN_MM);
+  return { x0: e.pos[0] - w / 2, y0: e.pos[1] - h / 2,
+           x1: e.pos[0] + w / 2, y1: e.pos[1] + h / 2 };
+}
+
+function fitInside(r, host) {
+  // Shrink and slide the child until it sits wholly inside its parent's shape.
+  // Containment is then visible at a glance, whatever the real footprints say.
+  const px = Math.min(NEST_PAD, (host.x1 - host.x0) * 0.18);
+  const py = Math.min(NEST_PAD, (host.y1 - host.y0) * 0.18);
+  const box = { x0: host.x0 + px, y0: host.y0 + py, x1: host.x1 - px, y1: host.y1 - py };
+  const w = Math.max(6, Math.min(r.x1 - r.x0, box.x1 - box.x0));
+  const h = Math.max(6, Math.min(r.y1 - r.y0, box.y1 - box.y0));
+  const cx = clamp((r.x0 + r.x1) / 2, box.x0 + w / 2, box.x1 - w / 2);
+  const cy = clamp((r.y0 + r.y1) / 2, box.y0 + h / 2, box.y1 - h / 2);
+  return { x0: cx - w / 2, y0: cy - h / 2, x1: cx + w / 2, y1: cy + h / 2 };
+}
+
+const onStrip = (e, byId) =>
+  e.status === "OFF_DESK" || (e.relation === "HELD" && byId[e.parent]?.is_agent);
+
+const nests = (e, byId) => {
+  const par = byId[e.parent];
+  return (e.status === "HIDDEN" || e.status === "UNRESOLVED") && par && !par.is_agent;
+};
+
+function depth(e, byId) {
+  let d = 0, node = e, guard = new Set([e.id]);
+  while (byId[node.parent] && !guard.has(node.parent)) {
+    guard.add(node.parent);
+    node = byId[node.parent];
+    d++;
+  }
+  return d;
+}
+
+// ---- the desk map -------------------------------------------------------
+
+function drawMap(state) {
+  const [x0, y0, x1, y1] = state.mat;
+  matEl.setAttribute("viewBox", `${x0 - 6} ${y0 - 6} ${x1 - x0 + 12} ${y1 - y0 + 12}`);
+
+  const byId = {};
+  for (const e of state.entities) byId[e.id] = e;
+
+  const placed = {};
+  const rectFor = (e, guard) => {
+    if (placed[e.id]) return placed[e.id];
+    let r = ownRect(e);
+    const par = byId[e.parent];
+    if (nests(e, byId) && !onStrip(par, byId) && !guard.has(par.id)) {
+      guard.add(par.id);
+      r = fitInside(r, rectFor(par, guard));
+    }
+    placed[e.id] = r;
+    return r;
+  };
+
+  const shown = state.entities.filter(e => !e.is_agent && !onStrip(e, byId));
+  shown.sort((a, b) => depth(a, byId) - depth(b, byId) ||
+                       (b.footprint[0] * b.footprint[1]) - (a.footprint[0] * a.footprint[1]));
+
+  const parts = [`<rect class="edge" x="${x0}" y="${y0}" width="${x1 - x0}" height="${y1 - y0}" rx="4"/>`];
+  for (let x = x0 + 100; x < x1; x += 100)
+    parts.push(`<line class="grid" x1="${x}" y1="${y0}" x2="${x}" y2="${y1}"/>`);
+  for (let y = y0 + 100; y < y1; y += 100)
+    parts.push(`<line class="grid" x1="${x0}" y1="${y}" x2="${x1}" y2="${y}"/>`);
+  for (const f of [0.33, 0.67]) {  // the thirds `quadrant()` phrases positions against
+    const gx = x0 + (x1 - x0) * f, gy = y0 + (y1 - y0) * f;
+    parts.push(`<line class="third" x1="${gx}" y1="${y0}" x2="${gx}" y2="${y1}"/>`);
+    parts.push(`<line class="third" x1="${x0}" y1="${gy}" x2="${x1}" y2="${gy}"/>`);
+  }
+
+  for (const e of shown) {
+    const r = rectFor(e, new Set([e.id]));
+    const cx = (r.x0 + r.x1) / 2, cy = (r.y0 + r.y1) / 2;
+    const cls = e.status === "VISIBLE" ? "vis" : e.status === "HIDDEN" ? "hid" : "unres";
+    const inner = nests(e, byId);
+
+    // Opacity tracks decayed confidence: a belief going stale is something you watch.
+    const op = (MIN_OPACITY + (1 - MIN_OPACITY) * e.confidence).toFixed(2);
+    const g = [`<g class="${cls}" opacity="${op}">`];
+    g.push(`<rect class="fp" x="${r.x0}" y="${r.y0}" width="${r.x1 - r.x0}" height="${r.y1 - r.y0}" rx="3"/>`);
+    if (e.status === "VISIBLE") g.push(`<circle class="dot" cx="${cx}" cy="${cy}" r="5"/>`);
+    if (e.status === "UNRESOLVED") g.push(`<text class="qmark" x="${cx}" y="${cy + 10}">?</text>`);
+
+    const ty = inner ? r.y1 - 6 : Math.min(r.y1 + 17, y1 - 4);
+    g.push(`<text class="tag${inner ? " nested" : ""}" x="${cx}" y="${ty}">${esc(e.label)}</text>`);
+    g.push(`<title>${esc(e.label)} — ${esc(e.location)} (${e.confidence.toFixed(2)}, ${e.status})</title>`);
+    g.push("</g>");
+    parts.push(g.join(""));
+  }
+  matEl.innerHTML = parts.join("");
+
+  drawStrip(state.entities.filter(e => !e.is_agent && onStrip(e, byId)), byId);
+}
+
+function drawStrip(off, byId) {
+  // Everything that is not on the mat, greyed down the margin rather than deleted.
+  const held = off.filter(e => e.status !== "OFF_DESK");
+  const gone = off.filter(e => e.status === "OFF_DESK");
+  const parts = [];
+
+  if (held.length) {
+    parts.push(`<div class="strip-head">in hand</div>`);
+    for (const e of held) parts.push(chip(e, "held", "held"));
+  }
+  parts.push(`<div class="strip-head">off the desk</div>`);
+  if (!gone.length) parts.push(`<div class="empty">nothing yet</div>`);
+  for (const e of gone) parts.push(chip(e, "off", "gone " + e.seconds_since_confirmed + "s"));
+
+  stripEl.innerHTML = parts.join("");
+}
+
+function chip(e, cls, sub) {
+  const op = (MIN_OPACITY + (1 - MIN_OPACITY) * e.confidence).toFixed(2);
+  return `<div class="chip ${cls}" style="opacity:${op}" title="${esc(e.location)}">` +
+         `<b>${esc(e.label)}</b><span>${esc(sub)} · ${e.confidence.toFixed(2)}</span></div>`;
+}
+
+// ---- the event timeline -------------------------------------------------
+
+function rowHtml(ev) {
+  const bad = ev.kind === "BELIEF_FALSIFIED";
+  const alts = (ev.alternatives || [])
+    .map(a => `${esc(a.note)} (${Number(a.confidence).toFixed(2)})`).join(", ");
+
+  return `<div class="row fresh${bad ? " falsified" : ""}">` +
+    `<div class="row-head">` +
+      `<span class="at">${stamp(ev.ts)}</span>` +
+      `<span class="kind k-${esc(ev.kind)}">${esc(ev.kind)}</span>` +
+      `<span class="who">${esc(ev.label || ev.entity)}</span>` +
+      `<span class="conf">${ev.confidence.toFixed(2)}</span>` +
+    `</div>` +
+    `<div class="note">${esc(ev.note)}</div>` +
+    `<div class="cause">${esc(ev.cause)}${ev.frame_ref ? " · " + esc(ev.frame_ref) : ""}</div>` +
+    (alts ? `<div class="alts">also considered: ${alts}</div>` : "") +
+    `</div>`;
+}
+
+function pushEvents(events) {
+  // Prepend only what is new, so reading back through history is not interrupted.
+  const fresh = (events || []).filter(ev => !seen.has(ev.seq));
+  if (!fresh.length) return;
+  for (const ev of fresh) seen.add(ev.seq);
+
+  fresh.sort((a, b) => a.seq - b.seq);
+  timeline.insertAdjacentHTML("afterbegin", fresh.reverse().map(rowHtml).join(""));
+  while (timeline.children.length > MAX_ROWS) timeline.lastElementChild.remove();
+  document.getElementById("events-note").textContent = `${seen.size} · newest first`;
+}
+
+// ---- the stream ---------------------------------------------------------
+
+function apply(state) {
+  drawMap(state);
+  pushEvents(state.events);
+
+  const real = state.entities.filter(e => !e.is_agent);
+  const agent = state.entities.find(e => e.is_agent);
+  document.getElementById("count").textContent =
+    `${real.length} ${real.length === 1 ? "entity" : "entities"}`;
+  document.getElementById("dims").textContent =
+    `${state.mat[2] - state.mat[0]} × ${state.mat[3] - state.mat[1]} mm`;
+  document.getElementById("clock").textContent = stamp(state.ts);
+  handEl.classList.toggle("hidden", !(agent && agent.status === "VISIBLE"));
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/stream`);
+
+  ws.onopen = () => {
+    linkEl.classList.add("live");
+    linkEl.lastElementChild.textContent = "live";
+  };
+  ws.onmessage = msg => apply(JSON.parse(msg.data));
+  ws.onerror = () => ws.close();
+  ws.onclose = () => {
+    linkEl.classList.remove("live");
+    linkEl.lastElementChild.textContent = "reconnecting";
+    setTimeout(connect, RETRY_MS);
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
