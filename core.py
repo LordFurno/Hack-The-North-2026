@@ -4,6 +4,9 @@ import numpy as np
 import time, uuid
 
 DESK = "DESK"
+AGENT_ID = "AGENT" #The hand is an ordinary entity, its children are HELD
+
+Rect = tuple[float, float, float, float] #(x0,y0,x1,y1) mm, axis-aligned
 
 class Relation(str, Enum):
     ON = "ON"
@@ -28,7 +31,7 @@ class EventKind(str, Enum):
     LEFT_DESK = "LEFT_DESK"
     LOST = "LOST"
     CONFIRMED = "CONFIRMED"
-    BELIEF_FALSIFIED = "BELIF_FALSIFIED"
+    BELIEF_FALSIFIED = "BELIEF_FALSIFIED"
 
 
 
@@ -94,6 +97,24 @@ class Event:
     alternatives: list[dict] = field(default_factory=list)
     frame_ref: str = "" #keyframe that produced this
     note: str = "" #human-readable for the timeline
+
+
+@dataclass
+class Detection: #One segmented region in a settled frame
+    centroid: tuple[float, float] #(x,y) mm
+    size: tuple[float, float] #(w,h) mm
+    embedding: np.ndarray #(D,) L2-normalised
+    crop_path: str = ""
+
+
+@dataclass
+class Observation: #Everything perception learned from one settle. The only write to the world.
+    ts: float
+    frame_ref: str
+    detections: list[Detection] = field(default_factory=list)
+    changed: list[Rect] = field(default_factory=list) #mm regions that differ from last settle
+    agent_swept: list[Rect] = field(default_factory=list) #footprints the agent passed over
+    agent_present: bool = False #Agent still in frame at settle time
 
 
 def absolutePosition(e: Entity, world: dict[str, Entity]):
