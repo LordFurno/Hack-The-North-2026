@@ -44,7 +44,7 @@ class PreviewPoster:
     #The camera feed, for a human watching the dashboard. Newest frame wins and the rest
     #are dropped: the settle loop hands a frame over and returns immediately, because a
     #socket write in that loop is dropped frames and a settle that never fires.
-    def __init__(self, url: str, fps: float = 8.0, width: int = 640, quality: int = 60):
+    def __init__(self, url: str, fps: float = 8.0, width: int = 960, quality: int = 82):
         self.url = f"{url.rstrip('/')}/preview"
         self.interval = 1.0 / fps
         self.width = width
@@ -120,7 +120,7 @@ def main():
     ap.add_argument("--no-preview", action="store_true",
                     help="stop pushing the camera feed to the dashboard")
     ap.add_argument("--preview-fps", type=float, default=8.0)
-    ap.add_argument("--preview-width", type=int, default=640)
+    ap.add_argument("--preview-width", type=int, default=960)
     args = ap.parse_args()
 
     cfg = Config.load()
@@ -133,10 +133,12 @@ def main():
         cap = openCamera(args.camera if args.camera is not None else cam.get("index", 0),
                          width=cam.get("width", CAM_WIDTH),
                          height=cam.get("height", CAM_HEIGHT),
-                         exposure=cam.get("exposure", EXPOSURE))
+                         exposure=cam.get("exposure", EXPOSURE),
+                         focus=cam.get("focus")) #None means autofocus once, then lock
         print(f"camera {cam.get('index', args.camera)} at "
               f"{cam.get('width', CAM_WIDTH)}x{cam.get('height', CAM_HEIGHT)}, "
-              f"exposure {cam.get('exposure', EXPOSURE)}")
+              f"exposure {cam.get('exposure', EXPOSURE)}, "
+              f"focus {cam.get('focus', 'auto')}")
 
     #Markers first: a recording that shows four of them needs no calibration at all, and
     #on a live camera they make a bumped rig free. Clicked corners are the fallback.

@@ -1,6 +1,6 @@
 from calib import (CALIB_PATH, EXPOSURE, MAT_BOUNDS, REFERENCE_PATH, cameraSettings,
-                   captureReference, clickCorners, findMarkers, openCamera, pxToMm,
-                   saveCalib, solveHomography)
+                   captureReference, clickCorners, findMarkers, focusThenLock,
+                   openCamera, pxToMm, saveCalib, sharpness, solveHomography)
 import numpy as np
 import cv2, argparse
 
@@ -9,11 +9,13 @@ import cv2, argparse
 #over -- clear the desk properly, and take it after the exposure has settled, not before.
 
 WINDOW = "calibrate"
-HINT = "r reference  c corners  a aruco  [ ] exposure  s save  esc quit"
+HINT = ("r reference  c corners  a aruco  [ ] exposure  - = focus  f autofocus  "
+        "s save  esc quit")
 
 #Somewhere in here the picture has usable contrast without clipping. Outside it, refdiff
 #is thresholding noise at one end and blown highlights at the other.
 GOOD_MEAN = (60.0, 170.0)
+FOCUS_STEP = 5
 
 
 def drawMarkers(view: np.ndarray, seen: dict[int, tuple[float, float]]):
@@ -33,6 +35,21 @@ def drawMat(view: np.ndarray, H: np.ndarray):
         q = inv @ np.array([mm[0], mm[1], 1.0])
         quad.append((q[0] / q[2], q[1] / q[2]))
     cv2.polylines(view, [np.int32(quad)], True, (0, 255, 0), 2)
+
+
+def drawSharpness(view: np.ndarray, focus, sharp: float, best: float):
+    #Focus has no absolute scale and the camera's readback cannot be trusted, so show the
+    #measurement instead: this frame against the best this session has managed. Press f,
+    #or walk the focus keys, until the bar stops growing.
+    frac = 0.0 if best <= 0 else min(1.0, sharp / best)
+    w = int(260 * frac)
+    cv2.rectangle(view, (12, 88), (272, 106), (70, 70, 70), 1)
+    cv2.rectangle(view, (12, 88), (12 + w, 106),
+                  (120, 255, 120) if frac > 0.85 else (80, 160, 255), -1)
+    cv2.putText(view, f"focus {'auto' if focus is None else f'{focus:.0f}'}"
+                      f"   sharpness {sharp:7.1f}{'  BLURRY' if frac < 0.6 else ''}",
+                (282, 103), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (120, 255, 120) if frac > 0.85 else (80, 160, 255), 2)
 
 
 def drawStatus(view: np.ndarray, H, reference, cursor, exposure: float, mean: float):
@@ -65,8 +82,11 @@ def main():
     ap.add_argument("--reference", default=REFERENCE_PATH)
     args = ap.parse_args()
 
-    cap = openCamera(args.camera, exposure=args.exposure)
+    cap = openCamera(args.camera, exposure=args.exposure) #Autofocuses once, then locks
     H, reference, exposure = None, None, args.exposure
+    #None means "autofocus found it", which is what gets saved. A number here means the
+    #operator dialled it in by hand and wants that exact value reproduced.
+    focus, bestSharp = None, 1e-6
     pos = [None] #Boxed, because the callback has nowhere else to put it
 
     cv2.namedWindow(WINDOW)
@@ -85,7 +105,10 @@ def main():
         drawMarkers(view, seen)
         if H is not None:
             drawMat(view, H)
+        sharp = sharpness(frame)
+        bestSharp = max(bestSharp, sharp)
         drawStatus(view, H, reference, pos[0], exposure, float(frame.mean()))
+        drawSharpness(view, focus, sharp, bestSharp)
         cv2.imshow(WINDOW, view)
 
         k = cv2.waitKey(1) & 0xFF
@@ -117,6 +140,17 @@ def main():
             cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
             print(f"exposure {exposure:+.0f}"
                   + (", re-take the reference (r)" if reference is not None else ""))
+        elif ch in ("-", "="):
+            base = cap.get(cv2.CAP_PROP_FOCUS) if focus is None else focus
+            focus = max(0.0, base + (FOCUS_STEP if ch == "=" else -FOCUS_STEP))
+            cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+            cap.set(cv2.CAP_PROP_FOCUS, focus)
+            bestSharp = 1e-6 #The bar is relative, so rescale it once the lens has moved
+            print(f"focus {focus:.0f} (manual, and it will be saved as that)")
+        elif ch == "f":
+            focusThenLock(cap) #Hunt, then freeze it where the hunt ended
+            focus, bestSharp = None, 1e-6
+            print("autofocused and locked; saved as auto, since the readback is unreliable")
         elif ch == "s":
             if H is None or reference is None:
                 print("need both an H (c or a) and a reference (r) before saving")
@@ -124,7 +158,7 @@ def main():
             #The camera state goes in with it: a reference frame taken at one exposure
             #against frames captured at another is the whole desk reading as changed.
             saveCalib(H, reference, args.out, args.reference,
-                      camera=cameraSettings(cap, args.camera))
+                      camera=cameraSettings(cap, args.camera, focus))
             print(f"saved {args.out} and {args.reference}")
 
     cap.release()

@@ -1,8 +1,8 @@
-from calib import (MAT_BOUNDS, MAT_MM, findMarkers, level, loadCalib, pxToMm,
-                   rectPxToMm, saveCalib, solveHomography)
+from calib import (MAT_BOUNDS, MAT_MM, cameraSettings, findMarkers, level, loadCalib,
+                   loadCamera, pxToMm, rectPxToMm, saveCalib, solveHomography)
 from synth import MARKER_MM, matBackground, mmToPx, rectPx
 import numpy as np
-import cv2
+import cv2, json
 import pytest
 
 
@@ -56,6 +56,37 @@ def test_levelling_survives_a_black_reference():
     #max(ref.mean(), 1.0) is load-bearing: a black frame would otherwise divide by zero.
     ref = np.zeros((8, 8, 3), np.uint8)
     assert level(ref, np.full((8, 8, 3), 200, np.uint8)).max() == 0
+
+
+class FakeCap: #Just enough VideoCapture to answer cameraSettings
+    def __init__(self, focusReadback=0.0):
+        self.focusReadback = focusReadback
+
+    def get(self, prop):
+        return {cv2.CAP_PROP_FRAME_WIDTH: 1280.0, cv2.CAP_PROP_FRAME_HEIGHT: 720.0,
+                cv2.CAP_PROP_EXPOSURE: -6.0,
+                cv2.CAP_PROP_FOCUS: self.focusReadback}[prop]
+
+
+def test_a_lying_focus_readback_is_never_written_into_the_calibration():
+    #This camera reports CAP_PROP_FOCUS = 0 after a successful autofocus, and 0 set by
+    #hand is thirty times blurrier than where the lens actually is. Saving the readback
+    #would hand live.py a number that makes the picture worse every run.
+    saved = cameraSettings(FakeCap(focusReadback=0.0), index=1, focus=None)
+    assert saved["focus"] is None #"autofocus again", not "go to 0"
+    assert saved["exposure"] == -6.0 and saved["index"] == 1
+
+    #A value the operator dialled in IS reproduced, because then it is a real choice.
+    assert cameraSettings(FakeCap(focusReadback=0.0), 1, focus=35.0)["focus"] == 35.0
+
+
+def test_a_calibration_with_no_camera_block_still_loads(tmp_path):
+    #Calibrations saved before the camera block existed must not crash live.py.
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"H": np.eye(3).tolist(), "mat_bounds": list(MAT_BOUNDS),
+                                "reference": "reference.png"}))
+    assert loadCamera(str(path)) == {}
+    assert loadCamera(str(tmp_path / "absent.json")) == {}
 
 
 def test_calibration_round_trips_through_disk(tmp_path):

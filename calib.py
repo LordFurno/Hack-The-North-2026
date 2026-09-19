@@ -92,13 +92,19 @@ def openCamera(index: int = 0, width: int = CAM_WIDTH, height: int = CAM_HEIGHT,
     return cap
 
 
-def cameraSettings(cap: cv2.VideoCapture, index: int) -> dict:
+def cameraSettings(cap: cv2.VideoCapture, index: int, focus: float | None = None) -> dict:
     #What live.py has to reproduce for the saved reference frame to mean anything.
+    #
+    #`focus` is passed in rather than read back, because the readback lies: after a
+    #successful autofocus this camera still reports CAP_PROP_FOCUS = 0, and 0 set by hand
+    #is thirty times blurrier than where the lens actually ended up. Saving the readback
+    #would hand live.py a number that makes the picture worse. None means "autofocus
+    #again", which is the honest record of what happened.
     return {"index": index,
             "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
             "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
             "exposure": cap.get(cv2.CAP_PROP_EXPOSURE),
-            "focus": cap.get(cv2.CAP_PROP_FOCUS)}
+            "focus": focus}
 
 
 def level(ref: np.ndarray, now: np.ndarray) -> np.ndarray:
