@@ -7,8 +7,8 @@ from perceive import Config, SNAP_DIR
 import fake
 import omni
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response, StreamingResponse
 import numpy as np
 import argparse, asyncio, os, re, threading, time
 import uvicorn
@@ -20,6 +20,9 @@ HISTORY_LIMIT = 20
 STREAM_HZ = 5.0 #State is small enough to re-send whole, so decay is watchable
 UI_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
 SNAP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), SNAP_DIR)
+
+PREVIEW_HZ = 10.0 #Ceiling on what the mjpeg stream pushes, whatever arrives
+PREVIEW_STALE_S = 3.0 #After this with nothing posted, say so rather than showing a lie
 
 PREP = {Relation.IN: "in", Relation.UNDER: "under",
         Relation.ON: "on", Relation.HELD: "held by"}
@@ -35,6 +38,11 @@ STOP_WORDS = {"the", "a", "an", "my", "our", "your", "this", "that", "those",
 WORLD = World()
 LOCK = threading.Lock() #The fake feed and out-of-process perception write from other threads
 CONFIG = Config.load() #Only confirm_settles matters on this side of the wire
+
+#The camera feed, for a person to look at. Deliberately NOT part of the world: nothing
+#reads it, nothing reasons about it, and losing it costs a pane on a page and nothing
+#else. Observation remains the only thing perception writes into the model.
+PREVIEW = {"jpeg": None, "ts": 0.0, "seq": 0}
 
 app = FastAPI(title="spatial memory")
 omni.attach(WORLD, LOCK) #No API key, no labelling, no difference to anything else
@@ -282,6 +290,60 @@ def getSnap(name: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="no such keyframe")
     return FileResponse(path, media_type="image/jpeg")
+
+
+# ---- the camera feed ----------------------------------------------------
+
+@app.post("/preview")
+async def postPreview(request: Request):
+    #Perception pushes frames here for the dashboard to show. A single assignment, so no
+    #lock: a reader either gets the previous frame or the next one, and both are fine.
+    jpeg = await request.body()
+    if not jpeg:
+        raise HTTPException(status_code=400, detail="empty frame")
+    PREVIEW.update(jpeg=jpeg, ts=time.time(), seq=PREVIEW["seq"] + 1)
+    return {"accepted": True, "seq": PREVIEW["seq"], "bytes": len(jpeg)}
+
+
+@app.get("/preview.jpg")
+def getPreviewFrame():
+    if PREVIEW["jpeg"] is None:
+        raise HTTPException(status_code=404, detail="no camera feed; is live.py running?")
+    return Response(PREVIEW["jpeg"], media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/preview/status")
+def getPreviewStatus():
+    age = time.time() - PREVIEW["ts"] if PREVIEW["jpeg"] is not None else None
+    return {"live": age is not None and age < PREVIEW_STALE_S,
+            "seq": PREVIEW["seq"],
+            "seconds_since_frame": round(age, 2) if age is not None else None}
+
+
+MJPEG_TYPE = "multipart/x-mixed-replace; boundary=frame"
+
+
+def mjpegFrame(jpeg: bytes) -> bytes:
+    return (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
+
+
+@app.get("/preview.mjpg")
+async def getPreviewStream(request: Request):
+    #One connection, frames pushed as they arrive. Only send what is new, so a stalled
+    #camera costs an idle socket rather than the same frame ten times a second.
+    async def frames():
+        sent = -1
+        while not await request.is_disconnected(): #A tab that closed must end the loop,
+            jpeg, seq = PREVIEW["jpeg"], PREVIEW["seq"] #not leave it running forever
+            if jpeg is not None and seq != sent:
+                sent = seq
+                yield mjpegFrame(jpeg)
+            await asyncio.sleep(1.0 / PREVIEW_HZ)
+
+    return StreamingResponse(frames(), media_type=MJPEG_TYPE,
+                             headers={"Cache-Control": "no-store"})
 
 
 @app.websocket("/stream")

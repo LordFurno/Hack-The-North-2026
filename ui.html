@@ -260,6 +260,58 @@ section {
 
 .row.falsified .note { color: #fca5a5; }
 
+/* ---- camera feed ------------------------------------------------------ */
+
+/* What it is looking at, beside what it believes. The map is the point; this is
+   how you tell a wrong belief from a wrong detection without leaving the page. */
+#camera-pane { border-bottom: 1px solid var(--line); }
+
+.cam-body {
+  position: relative;
+  background: #000;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#camera-pane.off .cam-body { display: none; }
+
+#cam {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: none;
+}
+
+.cam-live #cam { display: block; }
+
+.cam-msg {
+  position: absolute;
+  padding: 0 16px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.cam-live .cam-msg { display: none; }
+
+.pane-head button {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
 /* ---- rewind ---------------------------------------------------------- */
 
 footer {
@@ -336,6 +388,17 @@ footer.rewound #live-btn {
   </section>
 
   <section id="timeline-pane">
+    <div id="camera-pane">
+      <div class="pane-head">
+        camera <b id="cam-note">waiting</b>
+        <button id="cam-toggle">hide</button>
+      </div>
+      <div class="cam-body" id="cam-body">
+        <img id="cam" alt="camera feed">
+        <div class="cam-msg" id="cam-msg">no feed &mdash; is live.py running?</div>
+      </div>
+    </div>
+
     <div class="pane-head">events <b id="events-note">newest first</b></div>
     <div id="timeline"></div>
   </section>
@@ -606,6 +669,67 @@ scrubEl.addEventListener("input", () => {
 
 document.getElementById("live-btn").addEventListener("click", goLive);
 pollSnapshots();
+
+// ---- the camera feed ----------------------------------------------------
+
+// An mjpeg stream the service re-serves from whatever live.py last pushed. The page
+// never touches a camera, so the feed is exactly what perception saw, not a second
+// view of the desk that could disagree with it.
+
+const camPane = document.getElementById("camera-pane");
+const camBody = document.getElementById("cam-body");
+const camImg  = document.getElementById("cam");
+const camNote = document.getElementById("cam-note");
+const camMsg  = document.getElementById("cam-msg");
+
+let camAttached = false;
+
+function attachCam() {
+  if (camAttached) return;
+  camAttached = true;
+  camImg.src = "/preview.mjpg?t=" + Date.now();   // cache-bust, or Chrome reuses a dead stream
+}
+
+function detachCam() {
+  camAttached = false;
+  camImg.removeAttribute("src");
+  camBody.parentElement.classList.remove("cam-live");
+}
+
+camImg.addEventListener("error", detachCam);
+
+async function pollCamera() {
+  try {
+    const s = await (await fetch("/preview/status")).json();
+    if (s.live) {
+      attachCam();
+      camPane.classList.add("cam-live");
+      camNote.textContent = `live · ${s.seq} frames`;
+    } else {
+      // Stale or never started. Drop the stream so a frozen last frame cannot be
+      // mistaken for a live desk -- that would be the page telling a lie.
+      detachCam();
+      camPane.classList.remove("cam-live");
+      camNote.textContent = s.seq ? "stalled" : "waiting";
+      camMsg.innerHTML = s.seq
+        ? `feed stopped &mdash; last frame ${Math.round(s.seconds_since_frame)}s ago`
+        : "no feed &mdash; is live.py running?";
+    }
+  } catch (err) {
+    detachCam();
+    camPane.classList.remove("cam-live");
+    camNote.textContent = "offline";
+  }
+  setTimeout(pollCamera, 2000);
+}
+
+document.getElementById("cam-toggle").addEventListener("click", ev => {
+  const off = camPane.classList.toggle("off");
+  ev.target.textContent = off ? "show" : "hide";
+  if (off) detachCam();            // a hidden pane should not hold a socket open
+});
+
+pollCamera();
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";

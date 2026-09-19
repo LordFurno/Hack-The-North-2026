@@ -40,6 +40,52 @@ def httpSink(url: str):
     return sink
 
 
+class PreviewPoster:
+    #The camera feed, for a human watching the dashboard. Newest frame wins and the rest
+    #are dropped: the settle loop hands a frame over and returns immediately, because a
+    #socket write in that loop is dropped frames and a settle that never fires.
+    def __init__(self, url: str, fps: float = 8.0, width: int = 640, quality: int = 60):
+        self.url = f"{url.rstrip('/')}/preview"
+        self.interval = 1.0 / fps
+        self.width = width
+        self.quality = quality
+        self.latest = None
+        self.ready = threading.Event()
+        self.sent = self.failed = 0
+        self.stop = False
+        threading.Thread(target=self.pump, daemon=True).start()
+
+    def __call__(self, frame): #What perceive.run calls, once per frame
+        self.latest = frame #One assignment, so the pump either gets this one or the next
+        self.ready.set()
+
+    def encode(self, frame) -> bytes:
+        h, w = frame.shape[:2]
+        if w > self.width:
+            frame = cv2.resize(frame, (self.width, int(h * self.width / w)),
+                               interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+        return buf.tobytes() if ok else b""
+
+    def pump(self):
+        while not self.stop:
+            self.ready.wait()
+            self.ready.clear()
+            frame = self.latest
+            if frame is None:
+                continue
+            try:
+                jpeg = self.encode(frame)
+                if jpeg:
+                    req = urllib.request.Request(
+                        self.url, data=jpeg, headers={"Content-Type": "image/jpeg"})
+                    urllib.request.urlopen(req, timeout=5.0).close()
+                    self.sent += 1
+            except (urllib.error.URLError, OSError):
+                self.failed += 1 #The dashboard is optional; perception carries on regardless
+            time.sleep(self.interval) #Rate limit here, not in the capture loop
+
+
 def localSink(world: World, cfg: Config, lock: threading.Lock):
     #Same code path, no HTTP. The world model lives in this process instead.
     def sink(obs: Observation):
@@ -71,6 +117,10 @@ def main():
     ap.add_argument("--no-agent", action="store_true", help="stub the agent, H3 goes quiet")
     ap.add_argument("--no-embed", action="store_true",
                     help="colour histograms instead of DINO, for a machine with no torch")
+    ap.add_argument("--no-preview", action="store_true",
+                    help="stop pushing the camera feed to the dashboard")
+    ap.add_argument("--preview-fps", type=float, default=8.0)
+    ap.add_argument("--preview-width", type=int, default=640)
     args = ap.parse_args()
 
     cfg = Config.load()
@@ -121,12 +171,22 @@ def main():
         sink = httpSink(args.url)
         print(f"posting observations to {args.url}")
 
+    #The feed goes to the service whether or not the world model lives there, so --local
+    #still fills the pane. It is a picture for a person, not an input to anything.
+    preview = None
+    if not args.no_preview:
+        preview = PreviewPoster(args.url, args.preview_fps, args.preview_width)
+        print(f"camera feed to {args.url}/preview at {args.preview_fps:g} fps")
+
     try:
         run(cap, det, sink, cfg, H, agent=agent, embed=embed, clock=clock,
-            root=args.snaps)
+            root=args.snaps, preview=preview)
     except KeyboardInterrupt:
         pass
     finally:
+        if preview is not None:
+            preview.stop = True
+            print(f"camera feed: {preview.sent} frame(s) posted, {preview.failed} failed")
         cap.release()
 
 

@@ -251,9 +251,14 @@ def observationJson(obs: Observation) -> dict:
 # ---- the settle loop ----------------------------------------------------
 
 def run(cap, det: Detector, sink, cfg: Config, H: np.ndarray, agent=None,
-        embed=None, clock=time.time, resolveH: bool = True, root: str = SNAP_DIR):
+        embed=None, clock=time.time, resolveH: bool = True, root: str = SNAP_DIR,
+        preview=None):
     #The trigger is motion STOPPING, not hand detection: frame difference over a threshold,
     #then quiet for ~500 ms. No model, no assumptions, trivially reliable.
+    #
+    #`preview` is shown to a human and read by nothing: Observation stays the only write
+    #into the world. Whatever is passed here must return immediately -- anything that
+    #blocks on a socket in this loop is dropped frames and a settle that never fires.
     embed = embed or histEmbed
     prev, quiet, settled = None, 0, None
 
@@ -261,6 +266,8 @@ def run(cap, det: Detector, sink, cfg: Config, H: np.ndarray, agent=None,
         ok, frame = cap.read()
         if not ok:
             return #A file ran out, or the camera went away. Either way there is no next frame
+        if preview is not None:
+            preview(frame)
         g = gray(frame)
 
         if prev is not None:

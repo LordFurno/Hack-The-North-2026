@@ -1,6 +1,6 @@
 from core import Rect
 import numpy as np
-import cv2, json, math, os
+import cv2, json, math, os, time
 
 #Two halves. Above the rule: the pure desk geometry the world model reasons in, no
 #camera anywhere near it. Below it: the homography, the camera and the reference frame,
@@ -44,14 +44,34 @@ EXPOSURE = -6 #A starting point only. What is right depends entirely on the room
               #pick, and saves the choice, because a reference frame taken at one exposure
               #is worthless against frames captured at another.
 SETTLE_READS = 15 #Frames to throw away while whatever is still automatic finds its level
+AUTOFOCUS_S = 2.0 #Long enough for the lens to hunt and land before we freeze it
+
+
+def sharpness(frame: np.ndarray) -> float:
+    #Variance of the Laplacian. Only comparable between shots of the same scene, which is
+    #all it is ever used for: is this frame crisper than the last one.
+    return float(cv2.Laplacian(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+
+
+def focusThenLock(cap: cv2.VideoCapture, seconds: float = AUTOFOCUS_S):
+    #Turning autofocus off does NOT focus the lens, it freezes it wherever it was parked
+    #-- which on this camera was a setting eight times blurrier than the sharp one. Let it
+    #hunt first, then lock it there, so the picture is both sharp AND stable.
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        cap.read()
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0) #Freeze it where the hunt ended
 
 
 def openCamera(index: int = 0, width: int = CAM_WIDTH, height: int = CAM_HEIGHT,
-               exposure: float | None = EXPOSURE) -> cv2.VideoCapture:
+               exposure: float | None = EXPOSURE,
+               focus: float | None = None) -> cv2.VideoCapture:
     #Auto anything is a slow leak into the detector: exposure drift fills refdiff with
-    #noise and shifts every embedding. These are silently ignored by plenty of backends
-    #-- CAP_PROP_AUTO_EXPOSURE reads back -1 on both cameras here -- which is exactly why
-    #level() exists as well. `exposure=None` leaves the camera's own choice alone.
+    #noise, and a lens that hunts shifts every embedding. These are silently ignored by
+    #plenty of backends -- CAP_PROP_AUTO_EXPOSURE reads back -1 on both cameras here --
+    #which is exactly why level() exists as well. `exposure=None` leaves the camera's own
+    #choice alone; `focus=None` means autofocus once, then lock.
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) #DSHOW opens in milliseconds on Windows
     if not cap.isOpened():
         raise SystemExit(f"no camera at index {index}")
@@ -61,7 +81,12 @@ def openCamera(index: int = 0, width: int = CAM_WIDTH, height: int = CAM_HEIGHT,
     if exposure is not None:
         cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+    if focus is None:
+        focusThenLock(cap)
+    else:
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        cap.set(cv2.CAP_PROP_FOCUS, focus)
     for _ in range(SETTLE_READS):
         cap.read()
     return cap
@@ -72,7 +97,8 @@ def cameraSettings(cap: cv2.VideoCapture, index: int) -> dict:
     return {"index": index,
             "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
             "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-            "exposure": cap.get(cv2.CAP_PROP_EXPOSURE)}
+            "exposure": cap.get(cv2.CAP_PROP_EXPOSURE),
+            "focus": cap.get(cv2.CAP_PROP_FOCUS)}
 
 
 def level(ref: np.ndarray, now: np.ndarray) -> np.ndarray:
