@@ -7,20 +7,16 @@ Detects up to 5 objects, outputs JSON schema, and draws bounding boxes on the im
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import mimetypes
-import os
-import time
+import re
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from dotenv import load_dotenv
-import httpx
 from PIL import Image, ImageDraw, ImageFont
+from yibu_http import build_omni_messages, chat_completion, require_api_key
 
-load_dotenv()
-DEFAULT_BASE_URL = "https://yibuapi.com/v1"
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 # ---------------------------------------------------------------------------
 # 1. JSON Schema Definition (Enforces max 5 objects)
@@ -57,83 +53,31 @@ DETECTION_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# 2. HTTP Helper & Message Building
+# 2. Response Parsing
 # ---------------------------------------------------------------------------
-def require_api_key() -> str:
-    key = os.getenv("YIBU_API_KEY")
-    if not key:
-        raise ValueError("Environment variable YIBU_API_KEY is not set.")
-    return key
+def extract_json(text: str) -> dict[str, Any]:
+    """Parse model text that should contain one JSON object."""
+    candidates = [text.strip()]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
 
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last != -1 and first < last:
+        candidates.append(text[first:last + 1])
 
-def _data_url(path: Path, fallback_mime: str) -> str:
-    mime = mimetypes.guess_type(path.name)[0] or fallback_mime
-    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
-
-
-def build_omni_messages(prompt: str, image_path: Path) -> list[dict[str, Any]]:
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": _data_url(image_path, "image/jpeg")}
-                }
-            ]
-        }
-    ]
-
-
-def extract_json(response_json: Mapping[str, Any]) -> dict[str, Any] | None:
-    choices = response_json.get("choices") or []
-    if not choices:
-        return None
-
-    message = choices[0].get("message") or {}
-    text = message.get("content")
-    if text and isinstance(text, str):
+    for candidate in candidates:
+        if not candidate:
+            continue
         try:
-            return json.loads(text.strip())
+            value = json.loads(candidate)
         except json.JSONDecodeError:
-            pass
+            continue
+        if isinstance(value, dict):
+            return value
 
-    return None
-
-
-def chat_completion(
-    *,
-    api_key: str,
-    model: str,
-    messages: list[dict[str, Any]],
-    response_format: dict[str, Any] | None = None,
-    base_url: str = DEFAULT_BASE_URL,
-    max_tokens: int = 512,
-    temperature: float = 0.1,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    endpoint = f"{base_url.rstrip('/')}/chat/completions"
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if response_format:
-        payload["response_format"] = response_format
-
-    with httpx.Client(timeout=120.0, trust_env=False) as client:
-        response = client.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        response.raise_for_status()
-        res_data = response.json()
-        parsed = extract_json(res_data)
-        if not parsed:
-            raise ValueError(f"Failed to parse JSON response: {res_data}")
-        return parsed, res_data
+    raise ValueError(f"Failed to parse JSON response text: {text}")
 
 
 # ---------------------------------------------------------------------------
@@ -223,25 +167,23 @@ def main() -> int:
     prompt = (
         "Identify and locate the most prominent objects in this image. "
         "Detect a MAXIMUM of 5 objects. For each object, return its label and "
-        "bounding box normalized to a 0-1000 scale as [ymin, xmin, ymax, xmax]."
+        "bounding box normalized to a 0-1000 scale as [ymin, xmin, ymax, xmax]. "
+        "Return only valid JSON matching this schema: "
+        f"{json.dumps(DETECTION_SCHEMA, separators=(',', ':'))}"
     )
 
-    messages = build_omni_messages(prompt, args.image)
+    messages = build_omni_messages(prompt, image=args.image)
 
     print("Sending detection request to YibuAPI...")
-    parsed_json, _ = chat_completion(
+    text, _response_json, _record = chat_completion(
         api_key=require_api_key(),
         model=args.model,
         messages=messages,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "object_detection_max5",
-                "strict": True,
-                "schema": DETECTION_SCHEMA
-            }
-        }
+        purpose="object_detection_max5",
+        max_tokens=512,
+        temperature=0.1,
     )
+    parsed_json = extract_json(text)
 
     objects = parsed_json.get("objects", [])
     print(f"\nDetected {len(objects)} object(s):")

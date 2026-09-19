@@ -1,0 +1,14 @@
+{
+ "pixel_delta": 25,
+ "motion_frac": 0.002,
+ "settle_frames": 15,
+ "min_region_px": 400,
+ "min_object_px": 900,
+ "ref_delta": 30,
+ "morph_px": 5,
+ "max_changed_frac": 0.6,
+ "confirm_settles": 0,
+ "chroma_hue": 60,
+ "chroma_tol": 18,
+ "chroma_sat": 60
+}

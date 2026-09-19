@@ -1,8 +1,12 @@
-# Spatial Memory System — Technical Spec
+# Spatial Memory System — Technical Spec v2
 
 A fixed overhead camera watches a desk. The system maintains a persistent model of every
 object on it — what it is, where it is, and what happened to it — and answers spoken
 questions about that model.
+
+**v2 changes:** no coloured mat, no boom, no lamp. Detection is reference-frame subtraction,
+not chroma. Omni labels and speaks; it does not detect. Sections marked **[BUILT]** describe
+code that already exists — they're here for reference, not to be rewritten.
 
 ---
 
@@ -14,1226 +18,451 @@ Conventional trackers delete a track when the object stops being visible. This s
 deletes an entity. A disappearance is an *event requiring an explanation*; the system commits
 to the best available explanation, records it with its alternatives, and later tests it.
 
-Three properties follow, and together they are the system:
-
 | Property | Meaning |
 | --- | --- |
 | **Persistence** | Entities have a *status*, not an existence flag. Confidence decays; the entity remains. |
 | **Causal provenance** | Every position change has an attributed cause, a timestamp, and a keyframe receipt. |
 | **Relative pose** | Position is stored relative to a parent. Move the parent, the children follow for free. |
 
-End to end:
+### The division of labour
 
-```
-camera ─► motion gate ─► settle ─► segment changed regions ─► embed ─► match
-                                                                        │
-                                          ┌─────────────────────────────┘
-                                          ▼
-                             resolve disappearances ─► world model ─► events
-                                                            │
-                                    voice query ─► tools ────┘─► spoken answer
-```
+The project is best described as **giving Qwen 3.5 Omni spatial memory**. Omni perceives and
+speaks; it has no persistence, and a context window — however large — is a buffer, not a store.
+Nothing in a window decays, gets verified, or can be told that a belief formed four minutes ago
+was just falsified.
+
+| Layer | Role | Timescale |
+| --- | --- | --- |
+| Omni | perceives, classifies, hears, speaks | transient, in-context |
+| World model | persists, relates, decays, verifies | durable, structured |
+| DINO | binds a record to a physical object across time | per-observation |
 
 ---
 
 ## 2. Scope
 
-The demo world is one desk under one camera pointing straight down. This restriction buys a
-real simplification, and every design decision below leans on it:
+One desk, one camera pointing down, one human.
 
 > **From directly overhead, occlusion has exactly two causes.** Something is on top of the
-> object, or the object left the desk. There is no "behind", no viewpoint-dependent depth
-> ordering, no oblique partial occlusion. The hypothesis space for a disappearance is small
-> and closed.
+> object, or the object left the desk. No "behind", no viewpoint-dependent depth ordering.
+> The hypothesis space for a disappearance is small and closed.
 
-**In scope:** rigid objects placed, moved, stacked, covered, contained and removed by hand;
-containment to arbitrary nesting depth; spoken queries about location, history and causation;
-explicit uncertainty in every answer.
+This is the only reason the camera must be overhead. A homography handles tilt fine — that's
+what it's for — but past roughly 15° off vertical, tall objects start leaning into their
+neighbours and "on top of" blurs into "beside". Roughly overhead is enough; perpendicular is
+not required.
 
-**Out of scope** — each is a day of work and none is the interesting part: SLAM or a moving
-camera; metric depth (the desk is a plane, a homography suffices); multi-camera fusion;
-analysis at frame rate; deformable objects and liquids; multi-person disambiguation; entity
-identity across a cold start with a non-empty desk.
+**Out of scope:** SLAM or a moving camera; metric depth; multi-camera fusion; analysis at frame
+rate; deformable objects; multi-person disambiguation; recovering identities across a cold start
+with a non-empty desk.
 
 ---
 
 ## 3. Physical setup
 
-### Bill of materials
+Everything the system needs:
 
-| Item | Purpose | Notes |
+| Requirement | Why | Acceptable |
 | --- | --- | --- |
-| USB webcam | The only sensor | 1080p ideal, 720p fine |
-| Overhead boom | Camera looking straight down | Ring-light stand with overhead arm; tripod with horizontal extension arm; clamp + gooseneck |
-| USB extension cable | Reaching the boom | The stock cable will not reach. Most commonly forgotten item |
-| Matte mat, saturated colour | Defines the world; makes segmentation trivial | **See note below** — not black |
-| One diffuse lamp | Softens shadows | Off-axis, so a hand casts no hard edge onto objects |
-| 4 printed ArUco markers | Homography | Taped at mat corners, inside frame |
+| Camera roughly overhead | The two-causes argument | Laptop webcam, phone, USB cam |
+| Camera does not move during a run | The **motion gate**, not the homography | Propped on books, taped to a shelf, monitor arm |
+| Locked exposure, WB, autofocus | Reference subtraction and embeddings both drift otherwise | See below |
+| An empty-desk reference frame | It *is* the detector | Clear desk, press a key |
 
-**On the mat colour.** Use a **matte, saturated mid-value colour** — green or blue cloth, or
-poster board. Not black, and not white.
+No mat. No boom. No lamp. The coloured mat in v1 existed solely because chroma segmentation
+needed a known background hue; reference subtraction doesn't care what the surface is.
 
-The reason is shadow rejection. A shadow on the mat keeps the mat's *hue* and loses *value*.
-If the mat is chromatic, you segment by hue distance and shadows are rejected for free,
-regardless of how dark they get:
+### Locking the camera
 
 ```python
-def foreground_mask(frame_bgr, mat_hue, hue_tol=18, sat_min=60):
-    """True where the pixel is NOT mat. Shadows keep mat hue -> rejected."""
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    h, s, _v = cv2.split(hsv)                      # note: value is unused
-    dh = np.minimum(np.abs(h.astype(int) - mat_hue),
-                    180 - np.abs(h.astype(int) - mat_hue))
-    is_mat = (dh < hue_tol) & (s > sat_min)
-    return (~is_mat).astype(np.uint8)
+cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # 0.25 = manual on most backends
+cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 ```
 
-Deliberately not using `v` is the whole trick. A black mat would make shadows invisible too,
-but it would also swallow every dark object; a chromatic mat keeps dark objects visible while
-still discarding their shadows.
+These are backend-dependent and often silently ignored. If exposure won't lock, brightness
+drift will slowly poison reference subtraction. Cheap insurance, three lines, do it regardless:
 
-### Geometry
-
-Horizontal FOV is typically 65–70°, so visible width ≈ `2h·tan(FOV/2)`:
-
-| Height | Field of view |
-| --- | --- |
-| 50 cm | ~65 cm |
-| 60 cm | ~80 cm |
-| 70 cm | ~95 cm |
-
-Mount at **60–70 cm**. Size the mat to sit comfortably inside the frame with all four markers
-visible. Objects should occupy ≥ 40×40 px; at 1080p over a 60 cm mat that is about 1.2 cm of
-real object, fine for mugs, boxes, keys and phones.
-
-### Camera settings — do this before writing any code
-
-```bash
-v4l2-ctl -d /dev/video0 --set-ctrl=auto_exposure=1            # 1 = manual
-v4l2-ctl -d /dev/video0 --set-ctrl=exposure_time_absolute=250
-v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_automatic=0
-v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_temperature=4600
-v4l2-ctl -d /dev/video0 --set-ctrl=focus_automatic_continuous=0
+```python
+def level(ref, now):
+    """Match the reference's brightness to the current frame before diffing."""
+    return np.clip(ref.astype(np.float32) * (now.mean() / max(ref.mean(), 1.0)), 0, 255).astype(np.uint8)
 ```
 
-macOS: use OpenCV's `CAP_PROP_AUTO_EXPOSURE` / `CAP_PROP_AUTO_WB` or the vendor utility.
+### Optional upgrade: ArUco markers
 
-Auto-exposure shifts the instant a hand enters the frame. That changes the apparent colour and
-brightness of *every* object, which shifts their embeddings, which breaks instance matching —
-and it presents as a model problem. This is the single most expensive thing to discover late.
+Four printed DICT_4X4_50 markers taped to the desk in a rectangle give you the homography *and*
+the world bounds, re-solvable on every settle so a bumped camera costs nothing. Worth doing if
+there's a printer. Without one, clicked corners (§4) are equivalent for a static camera.
 
 ---
 
 ## 4. Coordinates
 
-The entire spatial stack is one 3×3 homography. No depth model, no pose estimation, no SLAM.
+One 3×3 homography maps pixels to millimetres on the desk plane. No depth model, no pose
+estimation.
+
+### Primary: clicked corners
+
+Fastest path to a working system, needs no printer.
 
 ```python
-# perception/calib.py
-import cv2, numpy as np, json
+# calib.py
 
-MAT_MM = {                              # marker id -> (x, y) mm, measured once with a ruler
-    0: (0.0,   0.0),
-    1: (600.0, 0.0),
-    2: (600.0, 450.0),
-    3: (0.0,   450.0),
-}
-MAT_BOUNDS = (0.0, 0.0, 600.0, 450.0)   # x0, y0, x1, y1
+def clickCorners(frame) -> np.ndarray:
+    """Click 4 desk corners clockwise from top-left. Declares them MAT_BOUNDS."""
+    pts = []
+    cv2.imshow("calib", frame)
+    cv2.setMouseCallback("calib", lambda ev, x, y, *_:
+                         pts.append((x, y)) if ev == cv2.EVENT_LBUTTONDOWN else None)
+    while len(pts) < 4:
+        cv2.waitKey(50)
+    x0, y0, x1, y1 = MAT_BOUNDS
+    dst = np.float32([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+    H, _ = cv2.findHomography(np.float32(pts), dst)
+    return H
+```
 
-_DET = cv2.aruco.ArucoDetector(
-    cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50))
+`MAT_BOUNDS` stays `(0, 0, 600, 450)` — you're declaring the clicked quad to be a 600×450 mm
+region. It needn't be exactly true; it only needs to be consistent, because every threshold in
+the system is expressed in those units.
 
+### Upgrade: markers, re-solved per settle
 
-def find_markers(frame) -> dict[int, np.ndarray]:
-    corners, ids, _ = _DET.detectMarkers(frame)
-    if ids is None:
-        return {}
-    return {int(i): c[0].mean(axis=0) for c, i in zip(corners, ids.flatten())}
-
-
-def solve_homography(frame) -> np.ndarray | None:
-    seen = find_markers(frame)
+```python
+def solveHomography(frame) -> np.ndarray | None:
+    seen = findMarkers(frame)                    # aruco, id -> centre px
     pts = [(seen[i], MAT_MM[i]) for i in MAT_MM if i in seen]
     if len(pts) < 4:
-        return None
-    src = np.array([p for p, _ in pts], dtype=np.float32)
-    dst = np.array([m for _, m in pts], dtype=np.float32)
-    H, _ = cv2.findHomography(src, dst)
-    return H
-
-
-def px_to_mm(H: np.ndarray, pt) -> tuple[float, float]:
-    q = H @ np.array([pt[0], pt[1], 1.0])
-    return (float(q[0] / q[2]), float(q[1] / q[2]))
-
-
-def mm_to_px(H: np.ndarray, pt) -> tuple[float, float]:
-    q = np.linalg.inv(H) @ np.array([pt[0], pt[1], 1.0])
-    return (float(q[0] / q[2]), float(q[1] / q[2]))
-
-
-def on_mat(pt_mm) -> bool:
-    x0, y0, x1, y1 = MAT_BOUNDS
-    return x0 <= pt_mm[0] <= x1 and y0 <= pt_mm[1] <= y1
+        return None                              # keep the previous H
+    return cv2.findHomography(np.float32([p for p, _ in pts]),
+                              np.float32([m for _, m in pts]))[0]
 ```
 
-**Drift detection.** Persist `H` to disk and bind a recalibrate hotkey, because the boom will
-get bumped. Detect it automatically: if every marker centre shifts by a similar vector between
-two settles, re-solve rather than reporting every object as moved.
+Called on every settle, this makes camera drift a non-issue.
 
-```python
-def boom_moved(prev: dict[int, np.ndarray], now: dict[int, np.ndarray]) -> bool:
-    common = set(prev) & set(now)
-    if len(common) < 3:
-        return False
-    deltas = np.array([now[i] - prev[i] for i in common])
-    return bool(np.linalg.norm(deltas.mean(axis=0)) > 4.0      # coherent shift
-                and deltas.std(axis=0).max() < 3.0)            # not object motion
-```
+### Footprints **[BUILT]**
 
-### Footprints, not points
-
-Store an axis-aligned bounding box in mm alongside the centroid. Occlusion reasoning needs
-*area overlap*, not point containment: a box covering a mug overlaps the mug's footprint even
-when their centroids are 4 cm apart.
-
-```python
-Rect = tuple[float, float, float, float]    # x0, y0, x1, y1 in mm
-
-def overlap_fraction(a: Rect, b: Rect) -> float:
-    """Fraction of `a` that `b` covers. Asymmetric on purpose."""
-    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    return (ix * iy) / area_a if area_a > 0 else 0.0
-```
-
-Asymmetry matters: a large box fully covering a small mug gives `overlap_fraction(mug, box) =
-1.0` but `overlap_fraction(box, mug) ≈ 0.05`. You always want "how much of the *missing* thing
-is covered".
+`overlapFraction(a, b)` in `calib.py` — fraction of `a` that `b` covers, asymmetric on purpose.
+A large box fully covering a small mug gives 1.0 one way and ~0.05 the other; you always want
+*how much of the missing thing is covered*.
 
 ---
 
-## 5. Data model
+## 5. Data model **[BUILT]**
+
+`core.py` holds `Entity`, `Event`, `Detection`, `Observation`, `ExampleBank`, and the enums
+`Relation` (ON/IN/UNDER/HELD), `Status` (VISIBLE/HIDDEN/OFF_DESK/UNRESOLVED) and `EventKind`.
+
+The contract that matters: **`Observation` is the only write into the world.** Everything
+upstream of it is replaceable — that's what lets the detector change without touching any
+reasoning code.
 
 ```python
-# worldmodel/types.py
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-import numpy as np, time, uuid
-
-DESK = "DESK"
-
-
-class Relation(str, Enum):
-    ON    = "ON"       # resting on a surface or another object
-    IN    = "IN"       # inside a container
-    UNDER = "UNDER"    # covered by something that is not a container
-    HELD  = "HELD"     # in an agent's grasp
-
-
-class Status(str, Enum):
-    VISIBLE    = "VISIBLE"
-    HIDDEN     = "HIDDEN"        # believed present, occluded, with a named occluder
-    OFF_DESK   = "OFF_DESK"
-    UNRESOLVED = "UNRESOLVED"    # gone, no explanation
-
-
-class EventKind(str, Enum):
-    APPEARED         = "APPEARED"
-    MOVED            = "MOVED"
-    COVERED          = "COVERED"
-    REVEALED         = "REVEALED"
-    PICKED_UP        = "PICKED_UP"
-    PUT_DOWN         = "PUT_DOWN"
-    LEFT_DESK        = "LEFT_DESK"
-    LOST             = "LOST"
-    CONFIRMED        = "CONFIRMED"
-    BELIEF_FALSIFIED = "BELIEF_FALSIFIED"
-```
-
-### Exemplar bank
-
-Instance identity is a set of embeddings per entity, not a single vector. Kept as its own
-small type so the update policy lives in one place.
-
-```python
-@dataclass
-class ExemplarBank:
-    vectors: list[np.ndarray] = field(default_factory=list)
-    cap: int = 8
-
-    ADD_MIN_MATCH = 0.85    # only learn from confident matches
-    ADD_MAX_SIM   = 0.95    # only learn if it adds information
-
-    def best(self, q: np.ndarray) -> float:
-        return max((float(q @ v) for v in self.vectors), default=0.0)
-
-    def offer(self, v: np.ndarray, match_score: float) -> None:
-        """Conditionally absorb a new view of this object."""
-        if match_score < self.ADD_MIN_MATCH:
-            return                                   # not confident it's the same thing
-        if self.best(v) > self.ADD_MAX_SIM:
-            return                                   # redundant with what we have
-        self.vectors.append(v)
-        if len(self.vectors) > self.cap:
-            self._evict_most_redundant()
-
-    def _evict_most_redundant(self) -> None:
-        sims = [sum(float(a @ b) for b in self.vectors if b is not a)
-                for a in self.vectors]
-        self.vectors.pop(int(np.argmax(sims)))
-```
-
-Both thresholds matter. Learning from unconfident matches is how an entity's bank slowly
-becomes a different object; learning redundant views is how the bank fills with eight copies of
-one pose and then fails the moment the object is rotated.
-
-### Entity
-
-```python
-@dataclass
-class Entity:
-    id: str
-    label: str = "unknown object"
-    is_container: bool = False
-    is_agent: bool = False
-
-    bank: ExemplarBank = field(default_factory=ExemplarBank)
-
-    parent: str | None = DESK
-    relation: Relation = Relation.ON
-    pose: tuple[float, float] = (0.0, 0.0)      # mm, RELATIVE TO PARENT
-    size: tuple[float, float] = (0.0, 0.0)      # w, h in mm
-
-    status: Status = Status.VISIBLE
-    confidence: float = 1.0
-    last_seen: float = 0.0
-    last_confirmed: float = 0.0
-
-    @staticmethod
-    def new(**kw) -> "Entity":
-        now = time.time()
-        return Entity(id=uuid.uuid4().hex[:8], last_seen=now, last_confirmed=now, **kw)
-```
-
-### Event
-
-Append-only. This is the system's memory of causation.
-
-```python
-@dataclass
-class Event:
-    ts: float
-    entity: str
-    kind: EventKind
-    cause: str                                   # "agent" | "covered_by:<id>" | "unexplained"
-    confidence: float
-    from_state: dict | None = None               # {parent, relation, pose, status}
-    to_state:   dict | None = None
-    alternatives: list[dict] = field(default_factory=list)
-    frame_ref: str = ""                          # keyframe that produced this
-    note: str = ""                               # human-readable, for the timeline
-```
-
-`alternatives` costs nothing to record and is what lets the system explain itself rather than
-merely assert: *"it's under the box — I also considered you'd carried it off, but your hand
-left the frame empty."*
-
-`frame_ref` means every claim has a visual receipt. Showing that keyframe beside the answer is
-a strong demo beat.
-
-### The observation contract
-
-This is the interface between the two halves of the team. Agree it in the first thirty minutes
-and do not change it after.
-
-```python
-@dataclass
-class Detection:
-    """One segmented region in a settled frame."""
-    centroid: tuple[float, float]       # mm
-    size: tuple[float, float]           # w, h in mm
-    embedding: np.ndarray               # (D,), L2-normalised
-    crop_path: str
-
-
 @dataclass
 class Observation:
-    """Everything perception learned from one settle. The only write to the world."""
     ts: float
     frame_ref: str
-    detections: list[Detection]
-    changed: list[Rect]                         # mm regions that differ from last settle
-    agent_swept: list[Rect]                     # footprints the agent passed over
-    agent_present: bool                         # agent still in frame at settle time
+    detections: list[Detection]     # centroid mm, size mm, embedding, crop_path
+    changed: list[Rect]             # mm regions differing from the last settle
+    agent_swept: list[Rect]         # footprints the agent passed over (may be empty)
+    agent_present: bool
 ```
 
 ---
 
-## 6. The world
+## 6. The world **[BUILT]**
 
-```python
-# worldmodel/world.py
+`world.py`: `World.absolute` walks the parent chain and sums poses; `footprintRect`;
+`childrenOf`; `descendants`; `reparent` (the only mutation path, rejects cycles); `mint`;
+`decayed`. Plus `surfaceUnder`, `placeOn`, `covers`, `snapshot`, `missingEntities`.
 
-class World:
-    def __init__(self):
-        self.entities: dict[str, Entity] = {}
-        self.events: list[Event] = []
-        self._provisional: dict[int, tuple[Detection, int]] = {}   # flicker guard
+Moving a parent is one write — set `box.pose` and every descendant's absolute position follows
+with no propagation code.
 
-    # ---- geometry -------------------------------------------------------
-
-    def absolute(self, e: Entity | str) -> tuple[float, float]:
-        e = self.entities[e] if isinstance(e, str) else e
-        x, y = e.pose
-        p = e.parent
-        seen = {e.id}
-        while p and p != DESK:
-            if p in seen:                       # defensive; reparent() prevents this
-                break
-            seen.add(p)
-            par = self.entities[p]
-            x += par.pose[0]
-            y += par.pose[1]
-            p = par.parent
-        return (x, y)
-
-    def footprint(self, e: Entity | str) -> Rect:
-        e = self.entities[e] if isinstance(e, str) else e
-        cx, cy = self.absolute(e)
-        w, h = e.size
-        return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-
-    # ---- structure ------------------------------------------------------
-
-    def children_of(self, pid: str) -> list[Entity]:
-        return [e for e in self.entities.values() if e.parent == pid]
-
-    def descendants(self, pid: str) -> list[Entity]:
-        out, stack = [], [pid]
-        while stack:
-            for c in self.children_of(stack.pop()):
-                out.append(c)
-                stack.append(c.id)
-        return out
-
-    def reparent(self, e: Entity, parent: str | None,
-                 relation: Relation, abs_pos: tuple[float, float]) -> None:
-        """Set parent and store pose relative to it. Rejects cycles."""
-        if parent and parent != DESK:
-            if e.id == parent or any(d.id == parent for d in self.descendants(e.id)):
-                raise ValueError(f"reparent {e.id} under {parent} would cycle")
-            px, py = self.absolute(parent)
-        else:
-            px, py = (0.0, 0.0)
-        e.parent = parent
-        e.relation = relation
-        e.pose = (abs_pos[0] - px, abs_pos[1] - py)
-```
-
-**Moving a parent is a single write.** Set `box.pose`; every descendant's absolute position
-updates automatically. No propagation pass, no bookkeeping to get wrong — and the demo case
-"slide the box across the desk, then ask where the mug is" works without a line of code
-written for it.
-
-### Confidence decay
-
-```python
-HALF_LIFE = {                       # seconds
-    Status.HIDDEN:     3600.0,      # well-founded: the occluder is right there
-    Status.OFF_DESK:   1800.0,
-    Status.UNRESOLVED:  300.0,      # nothing is keeping this belief true
-}
-
-def decayed(self, e: Entity, now: float) -> float:
-    if e.status == Status.VISIBLE:
-        return 1.0
-    dt = now - e.last_confirmed
-    c = e.confidence * 0.5 ** (dt / HALF_LIFE[e.status])
-
-    # Stabiliser: if the occluder is still visible and hasn't moved, the
-    # evidence genuinely hasn't degraded, so don't pretend it has.
-    if e.status == Status.HIDDEN and e.parent in self.entities:
-        occ = self.entities[e.parent]
-        if occ.status == Status.VISIBLE and occ.last_confirmed >= e.last_confirmed:
-            c = max(c, 0.8)
-    return c
-```
-
-The stabiliser is the difference between a decay model that is merely present and one that is
-*right*. A mug under a box that nobody has touched should not become uncertain just because
-time passed.
+Confidence decays by status half-life (HIDDEN 3600s, OFF_DESK 1800s, UNRESOLVED 300s), with a
+stabiliser: a hidden child whose occluder is still visible and unmoved floors at 0.8, because
+that evidence genuinely hasn't degraded.
 
 ---
 
 ## 7. Perception
 
+### Latency budget
+
+This drives the whole design. Omni detection costs 3–4 s per call, which cannot sit in the
+per-settle path — a five-action demo would spend twenty seconds waiting and settles would queue
+behind each other on stale frames.
+
+| Path | Cost | What runs |
+| --- | --- | --- |
+| Every frame | ~1 ms | frame diff, motion gate |
+| Every settle | ~50 ms | refdiff → boxes → DINO → Observation → settle() |
+| Per **new** entity | 3–4 s, **async** | Omni → label + isContainer, cached forever |
+| Per query | 3–4 s | Omni voice loop |
+
+An entity is minted, tracked and displayed immediately with `label="unknown"`; the label
+patches in when the call returns. Tracking never waits on the network.
+
 ### The settle loop
 
-Tiered by cost. This is what lets it run on a laptop, and it is also what makes it correct —
-analysing mid-motion yields blurred masks and embeddings of half-occluded objects, which is
-worse than not analysing.
-
-| Tier | Rate | Work |
-| --- | --- | --- |
-| 0 | 30 fps | Frame difference → motion mask. Nothing else |
-| 1 | on settle | Analysis pass |
-| 2 | new entity only | One VLM call for a label. Cached forever |
-| 3 | on query | Voice → tool → world → speech |
+The trigger is **motion stopping**, not hand detection. Frame difference over a threshold, then
+quiet for ~500 ms. No model, no assumptions, trivially reliable.
 
 ```python
-# perception/camera.py
-
-SETTLE_FRAMES = 15          # ~500 ms at 30 fps
-MOTION_FRAC   = 0.002       # fraction of pixels differing
+SETTLE_FRAMES = 15          # ~500 ms at 30 fps; drop to 8 if people work fast
+MOTION_FRAC   = 0.002
 PIXEL_DELTA   = 25
 
-
-def run(cap, H, sink, agent_tracker):
-    prev = None
-    quiet = 0
-    settled = to_gray(grab(cap))
-    settled_bgr = None
-    agent_tracker.reset()
-
+def run(cap, det, world, sink):
+    prev, quiet, settled = None, 0, None
     while True:
         frame = grab(cap)
-        g = to_gray(frame)
-
+        g = gray(frame)
         if prev is not None:
             diff = cv2.absdiff(g, prev)
-            moving = float((diff > PIXEL_DELTA).mean()) > MOTION_FRAC
-
-            if moving:
+            if float((diff > PIXEL_DELTA).mean()) > MOTION_FRAC:
                 quiet = 0
-                agent_tracker.update(frame, diff, H)     # accumulate swept footprints
+                agent.update(frame, diff, H)        # optional; feeds H3 only
             else:
                 quiet += 1
-                if quiet == SETTLE_FRAMES:
-                    obs = analyse(settled, settled_bgr, g, frame, H, agent_tracker)
-                    sink(obs)
-                    settled, settled_bgr = g, frame
-                    agent_tracker.reset()
+                if quiet == SETTLE_FRAMES and settled is not None:
+                    try:
+                        sink(analyse(settled, frame, det, H, agent))
+                        settled = frame
+                    except DetectorError:
+                        pass                        # keep the old settled frame
+                    agent.reset()
+                elif settled is None:
+                    settled = frame
         prev = g
 ```
 
-The system is deliberately blind while a hand is in frame. It reasons about what changed
-between two stable states, which is exactly the information the world model needs.
+**A detector failure must abort the settle, never emit an empty `Observation`.** An empty one
+makes `missingEntities` fire for everything in the changed region and marks the whole desk
+`LOST` in a single tick.
 
-### The analysis pass
+### Analysis pass
 
-```python
-# perception/analyse.py
-
-def analyse(prev_gray, prev_bgr, now_gray, now_bgr, H, agent) -> Observation:
-    # 1. Where did anything change between the two settled frames?
-    d = cv2.absdiff(now_gray, prev_gray)
-    changed_px = cv2.morphologyEx((d > PIXEL_DELTA).astype(np.uint8),
-                                  cv2.MORPH_CLOSE, KERNEL_9)
-    regions_px = components(changed_px, min_area=MIN_REGION_PX)
-
-    # 2. Segment ONLY inside those regions. Everything else is unchanged by
-    #    definition and needs no work.
-    fg = foreground_mask(now_bgr, MAT_HUE)
-    detections = []
-    for r in regions_px:
-        for comp in components(fg[r.slice], min_area=MIN_OBJECT_PX):
-            box_px = comp.bbox_in(r)
-            emb    = embed(now_bgr, box_px)
-            (x0, y0), (x1, y1) = px_to_mm(H, box_px.tl), px_to_mm(H, box_px.br)
-            detections.append(Detection(
-                centroid=((x0 + x1) / 2, (y0 + y1) / 2),
-                size=(abs(x1 - x0), abs(y1 - y0)),
-                embedding=emb,
-                crop_path=save_crop(now_bgr, box_px),
-            ))
-
-    return Observation(
-        ts=time.time(),
-        frame_ref=save_frame(now_bgr),
-        detections=detections,
-        changed=[rect_px_to_mm(H, r) for r in regions_px],
-        agent_swept=agent.swept_mm(),
-        agent_present=agent.present,
-    )
-```
-
-**The subtlety that will otherwise cost you an hour.** Because you segment only inside changed
-regions, most entities produce no detection on any given settle — that is normal and means
-nothing. An entity counts as *missing* only if its footprint intersects a changed region and it
-still produced no match. Getting this wrong makes every object on the desk disappear on every
-frame.
+Only changed regions are examined. Everything else is unchanged by definition.
 
 ```python
-def missing_entities(world, obs, matched: set[str]) -> list[Entity]:
-    out = []
-    for e in world.entities.values():
-        if e.id in matched or e.status != Status.VISIBLE:
-            continue
-        fp = world.footprint(e)
-        if any(overlap_fraction(fp, region) > 0.2 for region in obs.changed):
-            out.append(e)          # it was where something changed, and it's not there now
-    return out
+def analyse(prevSettled, now, det, H, agent) -> Observation:
+    d = cv2.absdiff(gray(now), gray(prevSettled))
+    changed = components(morph(d > PIXEL_DELTA), minArea=MIN_REGION_PX)
+
+    dets = []
+    for box in det.detect(now, regions=changed):
+        (x0, y0), (x1, y1) = pxToMm(H, box.tl), pxToMm(H, box.br)
+        dets.append(Detection(centroid=((x0 + x1) / 2, (y0 + y1) / 2),
+                              size=(abs(x1 - x0), abs(y1 - y0)),
+                              embedding=embedder(now, box),
+                              crop_path=saveCrop(now, box)))
+    return Observation(ts=time.time(), frame_ref=saveFrame(now), detections=dets,
+                       changed=[rectPxToMm(H, r) for r in changed],
+                       agent_swept=agent.swept_mm(), agent_present=agent.present)
 ```
 
-### Segmentation: which path
+**The subtlety that costs an hour if missed.** Most entities produce no detection on most
+settles — normal, and it means nothing. An entity is *missing* only if its footprint intersects
+a changed region and it still produced no match. `missingEntities` in `world.py` handles this.
 
-Two options; pick by what is working at hour three.
+### Detector protocol
 
-**Chroma + connected components** (recommended to start): the `foreground_mask` above plus
-`cv2.connectedComponentsWithStats`. Zero model load, ~2 ms, and the chromatic mat makes it
-robust. Its weakness is touching objects merging into one blob.
+```python
+class Detector(Protocol):
+    def detect(self, frame, regions) -> list[BoxPx]: ...
+```
 
-**SAM 2** (upgrade if merging bites): prompt with each changed region's bounding box, take the
-returned masks. Handles touching objects properly, costs ~80 ms on a laptop GPU and a model
-download. Swap it in behind the same `components()` interface so nothing downstream changes.
+**`RefDiffDetector` — primary.** Subtract the stored empty-desk frame (brightness-levelled),
+threshold, connected components, intersected with changed regions. ~2 ms, entirely local, works
+on any surface. Weakness: touching objects merge into one blob, and it drifts if lighting or the
+camera changes.
+
+**`ChromaDetector` — optional.** Hue-distance mask against a coloured mat, ignoring the value
+channel so shadows are rejected for free. Only worth it if you end up with a green or blue
+surface. Strictly better than refdiff when available.
+
+**`OmniDetector` — not in the settle path.** Too slow. Keep the class if you want it for a
+one-off cold-start scan of a non-empty desk; it raises on timeout like any other detector.
 
 ---
 
-## 8. Instance identity
+## 8. Identity **[BUILT, matcher]**
 
-DINOv3's job is **instance re-identification**, not classification. The question is never "is
-this a mug" — the VLM answers that once, at birth. The question is "is this *the same mug*",
-and self-supervised dense features are unusually good at exactly that.
+DINO does **instance re-identification**, never location. Each box answers two independent
+questions:
 
-```python
-# perception/identity.py
-
-class Embedder:
-    def __init__(self, name="dinov3_vits16", device="cuda"):
-        self.model = torch.hub.load("facebookresearch/dinov3", name).to(device).eval()
-        self.device = device
-        self.tf = T.Compose([
-            T.ToTensor(),
-            T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
-
-    @torch.no_grad()
-    def __call__(self, frame_bgr, bbox_px) -> np.ndarray:
-        crop = tight_crop(frame_bgr, bbox_px, pad=0.10)
-        crop = square_pad(crop)                      # preserve aspect ratio, do not stretch
-        crop = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_AREA)
-        x = self.tf(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))[None].to(self.device)
-        f = self.model(x)[0]
-        return torch.nn.functional.normalize(f, dim=-1).cpu().numpy()
+```
+box px ──┬── homography ───────────────► WHERE  (mm on the plane)
+         └── crop → DINO → cosine ─────► WHICH  (which known entity)
 ```
 
-Square-padding rather than stretching matters more than it looks. A stretched crop of a rotated
-object embeds differently from the same object unrotated, and that is a false negative you will
-spend an hour chasing.
+`identity.py` has `match()`: cosine over exemplar banks, plus a **spatial prior**
+(`0.10 · exp(−d/150mm)`) which is the single highest-value line in the file. Two identical pens
+are indistinguishable by appearance; the one that was here 200 ms ago is overwhelmingly likely
+to be the one here now.
 
-### Matching
+`MATCH_LO = 0.55` below which it's a new entity, `MARGIN_MIN = 0.05` the required gap to the
+runner-up. Below that gap the match is `ambiguous` and the system says so rather than guessing.
 
-```python
-MATCH_HI     = 0.75     # accept
-MATCH_LO     = 0.55     # below this: it is a new entity
-MARGIN_MIN   = 0.05     # winner must beat runner-up by this
-PRIOR_WEIGHT = 0.10
-PRIOR_SIGMA  = 150.0    # mm
+The `Embedder` (torch, imported lazily) crops, square-pads — never stretches — resizes to 224
+and returns the normalised CLS token.
 
-
-@dataclass
-class MatchResult:
-    entity: Entity | None
-    score: float
-    ambiguous: bool = False
-    runner_up: Entity | None = None
-
-
-def match(world, det: Detection) -> MatchResult:
-    scored = []
-    for e in world.entities.values():
-        if e.status == Status.OFF_DESK or e.is_agent:
-            continue
-        s = e.bank.best(det.embedding)
-        d = dist(det.centroid, world.absolute(e))
-        s += PRIOR_WEIGHT * math.exp(-d / PRIOR_SIGMA)      # spatial prior
-        scored.append((s, e))
-
-    if not scored:
-        return MatchResult(None, 0.0)
-    scored.sort(key=lambda t: -t[0])
-    (s1, e1) = scored[0]
-    (s2, e2) = scored[1] if len(scored) > 1 else (0.0, None)
-
-    if s1 < MATCH_LO:
-        return MatchResult(None, s1)
-    if s1 - s2 < MARGIN_MIN:
-        return MatchResult(e1, s1, ambiguous=True, runner_up=e2)
-    return MatchResult(e1, s1)
-```
-
-The **spatial prior** is the highest-value line in this file. Two identical black pens are
-near-indistinguishable by appearance, but the one that was at this spot 200 ms ago is
-overwhelmingly likely to be the one here now. Appearance alone coin-flips; appearance plus
-proximity almost never does.
-
-**On `ambiguous`:** do not guess silently. Keep both candidates alive, leave the entity
-`UNRESOLVED`, and let the query layer say so — *"one of your two black pens; I can't tell them
-apart, but the one on the left hasn't moved since you put it there."* Admitting this reads as
-more sophisticated than guessing right by luck.
-
-### Flicker guard
-
-A mask must persist across two consecutive settles before it mints an entity. This removes most
-spurious entities on its own.
-
-```python
-def confirm_new(world, det, key: int, now: float) -> Entity | None:
-    prior = world._provisional.pop(key, None)
-    if prior is None:
-        world._provisional[key] = (det, 1)
-        return None                              # wait one more settle
-    return world.mint(det, now)
-```
+What identity buys that a label cannot: re-acquiring a specific object after minutes of
+occlusion when several share a label; separating two objects the VLM describes identically; and
+noticing a **substitution** — lift the box, find a *different* mug, and get a
+`BELIEF_FALSIFIED` where label-matching would have silently agreed.
 
 ---
 
-## 9. The agent
+## 9. The agent — optional
 
-> **Design note.** An earlier draft treated hand detection as a side channel feeding one
-> hypothesis. That was the hack — not the heuristic itself, but the special-casing. The agent
-> is modelled here as an ordinary entity whose children are `HELD`. Picking up is a reparent;
-> putting down is a reparent; the containment graph does all the work. Only the *detector*
-> stays heuristic, which is an ordinary engineering position.
+The agent is an ordinary entity whose children are `HELD`. Pick up and put down are reparents;
+the containment graph does the work.
 
-### Why the heuristic is defensible
+The detector is heuristic: from overhead over a bounded surface, an arm **must** enter from the
+frame border, so the largest edge-touching motion blob is the agent, and the point furthest from
+the entering edge is the hand rather than the elbow.
 
-From overhead, over a bounded mat, an arm **must** enter from the frame border. That is a
-geometric fact of the rig, not an arbitrary rule.
+**This feeds H3 and nothing else.** H1, H2 and H4 use no agent evidence at all. With the tracker
+absent or broken, the system degrades from *"you carried it off"* to *"it left the desk, cause
+unknown"* — a weaker answer, not a wrong one, and nothing stops updating. A heuristic feeding
+one optional hypothesis is a normal engineering choice; a heuristic gating the update loop would
+not be.
 
-```python
-# perception/agent.py
-
-class AgentTracker:
-    MIN_AREA_PX = 4000
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self._swept: list[Rect] = []
-        self.present = False
-
-    def update(self, frame, diff, H) -> tuple[float, float] | None:
-        mask = cv2.dilate((diff > PIXEL_DELTA).astype(np.uint8), KERNEL_9)
-        h, w = mask.shape
-        n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask)
-
-        for i in range(1, n):
-            x, y, bw, bh, area = stats[i]
-            edge = x <= 2 or y <= 2 or x + bw >= w - 2 or y + bh >= h - 2
-            if not (edge and area > self.MIN_AREA_PX):
-                continue
-
-            tip_px = self._far_tip(lbl == i, entered_from=(x, y, bw, bh, w, h))
-            self.present = True
-            self._swept.append(footprint_mm_at(H, tip_px, radius_mm=45))
-            return px_to_mm(H, tip_px)
-        self.present = False
-        return None
-
-    @staticmethod
-    def _far_tip(component_mask, entered_from) -> tuple[int, int]:
-        """The hand is the point furthest from the edge the arm came through."""
-        ys, xs = np.nonzero(component_mask)
-        x, y, bw, bh, w, h = entered_from
-        if x <= 2:      return (int(xs.max()), int(ys[xs.argmax()]))
-        if y <= 2:      return (int(xs[ys.argmax()]), int(ys.max()))
-        if x + bw >= w - 2: return (int(xs.min()), int(ys[xs.argmin()]))
-        return (int(xs[ys.argmin()]), int(ys.min()))
-
-    def swept_mm(self) -> list[Rect]:
-        return self._swept
-```
-
-Taking the point furthest from the entering edge gives you the hand rather than the elbow.
-
-### What it cannot do, and the upgrade
-
-| Limitation | Consequence |
-| --- | --- |
-| Cannot tell hand from sleeve or cable | Occasional spurious sweep; harmless, H2 is checked first |
-| Cannot distinguish two hands | "Who moved it" means "a person moved it" |
-| Cannot tell a full hand from an empty one | H3 cannot confirm the object actually left with the hand |
-
-The third is the only one that costs accuracy. The fix, if it bites, is MediaPipe Hands — wrist
-and fingertip keypoints, ~5 ms on CPU, works acceptably from overhead, and grasp aperture
-separates full from empty:
-
-```python
-def grasping(landmarks) -> bool:
-    """Thumb tip to index tip, normalised by hand span."""
-    thumb, index, wrist = landmarks[4], landmarks[8], landmarks[0]
-    span = np.linalg.norm(np.array(landmarks[9]) - np.array(wrist))
-    return np.linalg.norm(np.array(thumb) - np.array(index)) / span < 0.45
-```
-
-Forty minutes and one dependency. Do it only if the heuristic misbehaves.
-
-### Graceful degradation
-
-**The permanence logic does not depend on the agent at all.** H1, H2 and H4 use no agent
-evidence. If the detector fails completely, the system degrades from *"you carried it off"* to
-*"it left the desk, cause unknown"* — a weaker answer, not a wrong one. That property is what
-makes the heuristic acceptable rather than load-bearing.
+Upgrade if it misbehaves: MediaPipe Hands, ~5 ms CPU, and grasp aperture separates a full hand
+from an empty one.
 
 ---
 
-## 10. Disappearance resolution
+## 10. Disappearance resolution **[BUILT]**
 
-Entity `E` was `VISIBLE` at pose `P`, its footprint intersects a changed region, and it
-produced no match. Something must account for that.
+`resolve.py`. Entity was `VISIBLE`, its footprint intersects a changed region, it produced no
+match. Evaluate in order, take the first that fires, record the rest as `alternatives`.
 
-```python
-# worldmodel/resolve.py
+| | Hypothesis | Condition | Result |
+| --- | --- | --- | --- |
+| H1 | Moved | matched a detection elsewhere | `MOVED`, 0.95 |
+| H2 | Covered | a detection overlaps its old footprint ≥ `COVER_MIN` | `HIDDEN`, `IN`/`UNDER` |
+| H3 | Carried | agent swept its footprint, matched nowhere | `PICKED_UP` / `LEFT_DESK` |
+| H4 | Lost | nothing fits | `UNRESOLVED`, 0.40 |
 
-@dataclass
-class Hypothesis:
-    kind: EventKind
-    confidence: float
-    parent: str | None
-    relation: Relation
-    status: Status
-    cause: str
-    note: str
-```
+`missing.sort(key=lambda e: e.id not in matches)` in `settle()` is load-bearing: resolving
+matched entities first is what lets H2 see the occluder at its *new* position.
 
-Evaluate in order; take the first that fires; record the rest as `alternatives`.
-
-### H1 — Moved
-
-`E`'s embedding matched a detection elsewhere on the mat. Not really a disappearance; checked
-first because it is the common case and it is free (the match already happened).
-
-```python
-def h1_moved(world, e, matches) -> Hypothesis | None:
-    hit = matches.get(e.id)
-    if hit is None:
-        return None
-    return Hypothesis(EventKind.MOVED, 0.95,
-                      parent=surface_under(world, hit.centroid),
-                      relation=Relation.ON, status=Status.VISIBLE,
-                      cause="agent", note=f"moved to {phrase_pos(hit.centroid)}")
-```
-
-### H2 — Covered
-
-A detection now overlaps `E`'s last footprint that was not there before.
-
-```python
-COVER_MIN = 0.5
-
-def h2_covered(world, e, new_entities) -> Hypothesis | None:
-    fp = world.footprint(e)
-    best, best_ov = None, 0.0
-    for c in new_entities:                       # entities detected at this settle
-        ov = overlap_fraction(fp, world.footprint(c))
-        if ov > best_ov:
-            best, best_ov = c, ov
-    if best is None or best_ov < COVER_MIN:
-        return None
-
-    rel = Relation.IN if best.is_container else Relation.UNDER
-    return Hypothesis(EventKind.COVERED,
-                      confidence=min(0.98, 0.6 + 0.4 * best_ov),
-                      parent=best.id, relation=rel, status=Status.HIDDEN,
-                      cause=f"covered_by:{best.id}",
-                      note=f"{rel.value.lower()} the {best.label}")
-```
-
-`IN` versus `UNDER` comes from `is_container`, which the VLM sets at labelling time. The
-distinction only affects phrasing — *"in the tin"* against *"under the box"* — but that phrasing
-is what makes the demo land.
-
-### H3 — Carried off
-
-The agent swept `E`'s footprint during the motion burst and `E` matched nothing anywhere.
-
-```python
-def h3_carried(world, e, obs) -> Hypothesis | None:
-    fp = world.footprint(e)
-    if not any(overlap_fraction(fp, s) > 0.3 for s in obs.agent_swept):
-        return None
-    if obs.agent_present:
-        return Hypothesis(EventKind.PICKED_UP, 0.80,
-                          parent=AGENT_ID, relation=Relation.HELD,
-                          status=Status.HIDDEN, cause="agent",
-                          note="in your hand")
-    return Hypothesis(EventKind.LEFT_DESK, 0.85,
-                      parent=None, relation=Relation.ON, status=Status.OFF_DESK,
-                      cause="agent", note="taken off the desk")
-```
-
-### H4 — Unexplained
-
-Nothing fits. Keep the last known pose and parent; lower confidence sharply.
-
-```python
-def h4_lost(world, e, obs) -> Hypothesis:
-    return Hypothesis(EventKind.LOST, 0.40,
-                      parent=e.parent, relation=e.relation,
-                      status=Status.UNRESOLVED, cause="unexplained",
-                      note="lost track of it")
-```
-
-This is not an embarrassing state; it is the honest one, and the query layer reports it as
-such.
-
-### The resolver
-
-```python
-def resolve(world, e, obs, matches, new_entities) -> Event:
-    cands = [h for h in (h1_moved(world, e, matches),
-                         h2_covered(world, e, new_entities),
-                         h3_carried(world, e, obs),
-                         h4_lost(world, e, obs)) if h is not None]
-    winner, rest = cands[0], cands[1:]
-    before = snapshot(world, e)
-
-    world.reparent(e, winner.parent, winner.relation,
-                   abs_pos=world.absolute(e) if winner.status != Status.VISIBLE
-                           else matches[e.id].centroid)
-    e.status, e.confidence = winner.status, winner.confidence
-    e.last_seen = obs.ts
-    if winner.status == Status.VISIBLE:
-        e.last_confirmed = obs.ts
-
-    return Event(ts=obs.ts, entity=e.id, kind=winner.kind, cause=winner.cause,
-                 confidence=winner.confidence, from_state=before,
-                 to_state=snapshot(world, e), frame_ref=obs.frame_ref,
-                 note=winner.note,
-                 alternatives=[{"kind": h.kind, "confidence": h.confidence,
-                                "note": h.note} for h in rest])
-```
+If detector boxes run loose, drop `COVER_MIN` from 0.5 toward 0.4 and use centroid distance as
+a tiebreak.
 
 ---
 
-## 11. Verification and falsified beliefs
+## 11. Verification and falsified beliefs **[BUILT]**
 
-A belief that is never tested is an assertion. The reveal path makes the system's claims
-falsifiable, and it produces the best moment in the demo.
+`verify.py`. On reveal, any match is a reveal — the note distinguishes "confirmed where I
+thought it was" from "found it, though not where I expected". Absence alone is falsification.
+
+Guard: a still-covering occluder means the belief is untested, not wrong.
+
+**The IN/UNDER split**, which must be present:
 
 ```python
-# worldmodel/verify.py
-
-REVEAL_RADIUS_MM = 60.0
-
-def verify_children(world, occluder: Entity, obs, matches, now: float) -> list[Event]:
-    """Called when `occluder` moves, shrinks, or leaves the desk."""
-    events = []
-    for child in world.children_of(occluder.id):
-        if child.status != Status.HIDDEN:
-            continue
-        expected = world.absolute(child)
-        hit = matches.get(child.id)
-        found = hit is not None and dist(hit.centroid, expected) < REVEAL_RADIUS_MM
-
-        if found:
-            world.reparent(child, surface_under(world, hit.centroid),
-                           Relation.ON, hit.centroid)
-            child.status, child.confidence = Status.VISIBLE, 1.0
-            child.last_confirmed = now
-            events.append(Event(now, child.id, EventKind.REVEALED,
-                                cause=f"revealed_by:{occluder.id}", confidence=1.0,
-                                frame_ref=obs.frame_ref,
-                                note=f"confirmed where I thought it was"))
-        else:
-            child.status, child.confidence = Status.UNRESOLVED, 0.2
-            events.append(Event(now, child.id, EventKind.BELIEF_FALSIFIED,
-                                cause=f"expected under {occluder.label}, absent on reveal",
-                                confidence=0.2, frame_ref=obs.frame_ref,
-                                note=f"I was wrong — not under the {occluder.label}"))
-    return events
+if occluder.status in (Status.OFF_DESK, Status.HIDDEN) and child.relation == Relation.IN:
+    child.status = occluder.status      # it's in there, wherever there is now
+    continue
 ```
 
-### Announce the falsification
+Keys `IN` a tin travel with the tin. A mug `UNDER` a lifted box stays on the desk and *is*
+falsified if it didn't turn up. Without this, the container demo — put keys in a tin, carry the
+tin away, ask where the keys are — gives the wrong answer.
 
-When `BELIEF_FALSIFIED` fires, say so unprompted through the voice layer:
-
-> *"I was wrong — the mug isn't under the box. The last time I actually saw it was 03:41,
-> before you covered it."*
-
-This is counterintuitive and correct: **a system that announces its own errors reads as far
-more sophisticated than one that is silently right.** It demonstrates that the beliefs are
-real, held with confidence, and tested — and it converts the worst failure mode, a wrong
-answer, into a feature, because the error is caught and reported rather than asserted.
-
-Budget ten minutes at the end to make this trigger cleanly. In the demo, palm an object out
-from under the box while covering it, then lift the box. That moment is worth more than any
-successful lookup.
-
-### Free re-confirmation
-
-Every `VISIBLE` entity that matched a detection gets `last_confirmed = now` and `confidence =
-1.0`. The matching already happened, so this costs nothing — and it keeps the decay model
-honest: confidence measures *time since the world last agreed with the model*, not time since
-the entity was created.
+**Announce falsification unprompted.** *"I was wrong — the mug isn't under the box. Last time I
+actually saw it was 03:41."* A system that reports its own errors reads as far more
+sophisticated than one that is silently right, and it converts the worst failure mode into the
+best demo beat. Palm the object out while covering it, then lift the box.
 
 ---
 
 ## 12. Query layer
 
-### Service boundary
-
-The world model runs as an HTTP service. Perception is its only writer; everything else reads.
-
 ```
-POST /observation        # perception -> world (internal, the only mutation)
-GET  /state              # full snapshot: entities, relations, decayed confidence
-GET  /events?since=<ts>  # event log tail
-WS   /stream             # push: state deltas + events, for the UI
+POST /observation        GET /state          GET /events?since=
+WS   /stream             GET /snapshots      # for rewind
 ```
 
-### Tools
+Four tools, exposed as HTTP and MCP: `where_is`, `whats_in`, `who_moved`, `history`. Each
+returns compact JSON, never prose. **Phrasing is the model's job; grounding is the world
+model's.** That line is what stops the system hallucinating positions.
 
-The same four functions are exposed as HTTP endpoints and as MCP tools, so the voice layer, the
-UI, and any external agent all query one model.
-
-| Tool | Arguments | Returns |
-| --- | --- | --- |
-| `where_is` | `query: str` | entity, location phrase, confidence, last_confirmed, supporting event |
-| `whats_in` | `container: str` | entities with that container as an ancestor, each with confidence |
-| `who_moved` | `query: str` | most recent movement event: cause, timestamp, frame_ref |
-| `history` | `query: str, limit: int` | chronological events for that entity |
-
-Each returns compact JSON, never prose. **Phrasing is the model's job; grounding is the world
-model's job.** Keeping that line clean is what stops the system hallucinating positions.
-
-```python
-@app.get("/tools/where_is")
-def where_is(query: str):
-    e = resolve_referent(world, query)
-    if e is None:
-        return {"found": False, "query": query}
-    now = time.time()
-    return {
-        "found": True,
-        "entity": e.label,
-        "location": phrase_location(world, e),
-        "status": e.status,
-        "confidence": round(world.decayed(e, now), 2),
-        "last_confirmed": e.last_confirmed,
-        "seconds_since_confirmed": round(now - e.last_confirmed),
-        "supporting_event": last_event_for(world, e.id),
-    }
-```
-
-### Location phrasing
-
-Walk the parent chain, deepest first.
-
-```python
-PREP = {Relation.IN: "in", Relation.UNDER: "under",
-        Relation.ON: "on", Relation.HELD: "held by"}
-
-
-def phrase_location(world, e) -> str:
-    parts, node = [], e
-    while node.parent and node.parent != DESK:
-        par = world.entities[node.parent]
-        parts.append(f"{PREP[node.relation]} the {par.label}")
-        node = par
-    if not parts:
-        return f"on the desk, {quadrant(world.absolute(e))}"
-    return ", ".join(parts) + " on the desk"
-
-
-def quadrant(pos) -> str:
-    x0, y0, x1, y1 = MAT_BOUNDS
-    fx, fy = (pos[0] - x0) / (x1 - x0), (pos[1] - y0) / (y1 - y0)
-    v = "top" if fy < 0.33 else "bottom" if fy > 0.67 else "middle"
-    h = "left" if fx < 0.33 else "right" if fx > 0.67 else "centre"
-    return "in the centre" if (v, h) == ("middle", "centre") else f"toward the {v} {h}"
-```
-
-Nobody wants to hear millimetres.
-
-### Uncertainty in the answer
-
-Confidence is rendered, not hidden.
+Confidence is rendered, not hidden:
 
 | Confidence | Phrasing |
 | --- | --- |
 | > 0.9 | "It's under the box." |
-| 0.7 – 0.9 | "It should be under the box — I haven't seen it directly since 03:41, but the box hasn't moved." |
-| 0.4 – 0.7 | "Probably under the box, though I'm not certain." |
+| 0.7–0.9 | "It should be under the box — I haven't seen it since 03:41, but the box hasn't moved." |
+| 0.4–0.7 | "Probably under the box, though I'm not certain." |
 | < 0.4 | "I've lost track of it. Last confirmed on the desk at 03:41." |
 
-### Voice loop
+### Omni
 
-Qwen3.5-Omni handles the conversational turn end to end. Its Thinker takes streaming audio and
-video; its Talker synthesises speech in parallel, so no separate TTS is needed.
+Two jobs, both outside the settle path:
 
-1. Mic audio streams in.
-2. The four tools are registered; Omni decides when to call them.
-3. Tool result returns as JSON.
-4. Omni phrases the spoken answer under a constraining system prompt.
+1. **Labelling** — one async call per new entity returning `label` and `isContainer`.
+2. **Voice** — Thinker takes streaming audio and video, Talker speaks, tools registered. Feed it
+   the camera stream as well as audio so referent resolution works: *"where's the one I just
+   had"*, or pointing and saying *"what about this one"*.
 
-Feed it the **live camera stream as well as audio**. That is what makes referent resolution
-work: when the user says *"where's the one I just had"* or points and says *"what about this
-one"*, Omni sees the gesture and the scene and can map the utterance to an entity id. Text-only
-would force the user to name objects exactly — a worse experience and a worse demo.
-
-The system prompt must be blunt:
+System prompt, blunt:
 
 ```
-You have a tool-backed world model of the desk. Every claim you make about where
-something is MUST come from a tool result. Never invent a location, never infer one
-from the camera image alone, and never smooth over a low confidence score. If a tool
-returns found=false, say you don't know. If it returns a low confidence, say so in
-the words given to you.
+Every claim you make about where something is MUST come from a tool result. Never
+invent a location, never infer one from the camera image alone, and never smooth over
+a low confidence score. If a tool returns found=false, say you don't know.
 ```
-
-Log every tool call and its result next to the spoken answer. This is how you catch
-hallucination in testing rather than on stage.
 
 ---
 
-## 13. Visualisation
+## 13. Dashboard
 
-Not decoration. It is how a spectator understands the system in three seconds, and it is the
-debugging tool that will save hours. Build it early, against the fake stream, before perception
-works.
+Two panes plus a scrubber.
 
-One page, two panes.
+**Left — desk map.** Entities at absolute positions. Solid = `VISIBLE`; hollow dashed and
+nested inside the parent's shape = `HIDDEN`; faded with a question mark = `UNRESOLVED`; greyed
+into a margin strip = `OFF_DESK`. **Opacity tracks confidence**, so a decaying belief is
+something you can watch fade.
 
-**Left — the desk map.** A rectangle at the mat's aspect ratio, entities at absolute positions.
+**Right — event timeline.** Newest first: timestamp, label, kind, cause, confidence.
+`BELIEF_FALSIFIED` in red.
 
-- Solid dot — `VISIBLE`
-- Hollow dashed outline, nested *inside its parent's shape* — `HIDDEN`, so containment is
-  visible at a glance
-- Faded with a question mark — `UNRESOLVED`
-- Greyed into a margin strip — `OFF_DESK`
-- **Opacity tracks confidence.** A belief decaying over time is something you can *watch* fade,
-  which communicates the whole confidence model without a word of explanation.
+**Rewind.** Snapshot the entire world state after every settle into a list alongside `events` —
+a few hundred bytes each at this scale. The scrubber indexes that list. **Do not invert the
+event log**; it's tempting and it's a trap.
 
-**Right — the event timeline.** Newest at top. Each row: timestamp, label, kind, cause,
-confidence. `BELIEF_FALSIFIED` in red. Clicking a row shows its `frame_ref` keyframe — the
-visual receipt.
-
-Optionally overlay the live feed at low opacity behind the map. Seeing the real mug and the
-model's dot sitting on top of each other is immediately convincing, and when they drift apart
-you know instantly that calibration slipped.
-
-Plain HTML plus a websocket to `/stream`. No framework — the state payload is small enough to
-re-render the whole scene on every delta.
+Because every `Event` carries `frame_ref`, scrubbing shows both the map state *and* the keyframe
+it was believed from. "Here's what it thought at 3:41, and here's the image it thought it from"
+beats a timeline alone.
 
 ---
 
-## 14. Build order
-
-Two people. The first thirty minutes decide whether you spend the rest of the time building or
-blocking each other.
-
-### Hour zero — the contract
-
-Before either of you writes real code, commit:
-
-- `types.py`, verbatim — `Entity`, `Event`, `Detection`, `Observation`, the enums.
-- The four endpoints and their exact JSON shapes.
-- `fake_perception.py`, emitting a scripted sequence on a timer.
-
-```python
-# fake/fake_perception.py — the most valuable file in the repo
-SCRIPT = [
-    (0.0,  "appear", "mug",  (150, 200), (80, 80)),
-    (3.0,  "appear", "box",  (400, 220), (160, 140)),
-    (6.0,  "move",   "box",  (150, 200)),          # box now covers mug
-    (9.0,  "move",   "box",  (420, 300)),          # slid away; mug should be revealed
-    (12.0, "remove", "mug"),                       # palmed off -> LEFT_DESK
-]
-```
-
-That script exercises every path: appearance, covering, transitive motion, reveal-confirm, and
-carried-off. The query layer, the tool surface and the UI can all be finished against it while
-the camera is still on the bench.
-
-### Split
-
-**Person A — perception.** Camera loop, motion gating, settle detection, segmentation, DINOv3
-matching, agent tracker. This half has the unknown unknowns; it goes to whoever has used DINO.
-
-**Person B — everything downstream.** World model service, resolver, tools, Omni voice loop,
-referent resolution, UI, demo script. Entirely against the fake stream until integration.
-
-Note the resolver sits with B, not A. It is pure logic over the `Observation` contract, it is
-fully testable against the fake stream, and keeping it out of the perception process means A
-can rewrite segmentation without touching it.
-
-### Schedule
-
-| Hours | A | B |
-| --- | --- | --- |
-| 0–1 | Contract, repo, camera mounted, homography solved | Contract, service skeleton, fake stream |
-| 1–4 | Real detections flowing as `Observation` | World model + resolver + UI on fake data |
-| 4–8 | Agent tracker, segmentation hardening | Voice → tool → spoken answer |
-| 8–10 | **Integrate.** Target: place mug, cover, ask, correct answer | |
-| 10–15 | Sleep | Polish, second demo path |
-| 15–20 | Polish, harden | Sleep |
-| 16–20 | Pointer hardware, if the core is solid | |
-| 20–22 | Rehearse five times. Write the submission | |
-
-**Stagger the sleep.** Two people who both work straight through ship less than two people who
-each get four hours.
-
-### Cut order
-
-Pointer hardware → event timeline UI → referent resolution → `who_moved` and `history`.
-**Never cut the cover-and-ask path.** That is the demo.
-
-### The pointer, if time allows
-
-A pan/tilt laser (2× SG90, laser diode, ESP32) makes the answer physical, which beats any
-amount of UI. Self-calibrate it with the same camera:
-
-```python
-def calibrate_pointer(cap, servo, H):
-    """Sweep, find the dot, fit servo angles -> mm. No manual geometry."""
-    samples = []
-    for pan in range(-40, 41, 8):
-        for tilt in range(-40, 41, 8):
-            servo.goto(pan, tilt); time.sleep(0.15)
-            dot_px = brightest_spot(grab(cap))
-            if dot_px is not None:
-                samples.append((pan, tilt, *px_to_mm(H, dot_px)))
-    return fit_biquadratic(samples)     # (x_mm, y_mm) -> (pan, tilt)
-```
-
-Forty-five minutes, and the fact that it calibrated itself against the same camera is worth
-saying out loud.
-
-For a hidden object, point at the **covering** object: *"it's under this."* Pointing at what
-you cannot see is the whole idea expressed in one gesture.
-
----
-
-## 15. Failure modes
-
-Ranked by how likely each is to cost you an hour.
+## 14. Failure modes
 
 | Failure | Symptom | Mitigation |
 | --- | --- | --- |
-| **Auto-exposure shift** | Matching degrades the instant a hand enters frame; looks like a model problem | Lock exposure, WB and focus before any code. Listed first because it is both the most likely and the most misleading |
-| **Segmenting outside changed regions** | Every object "disappears" every settle | Only entities whose footprint intersects a changed region can be missing (§7) |
-| **Hard shadows** | Phantom entities beside real objects | Chromatic mat + hue-only foreground mask. Diffuse off-axis lamp |
-| **Mask flicker** | One object splits into two entities | Two-settle confirmation before minting |
-| **Identical objects** | Two black pens swap identity | Spatial prior; on ambiguity keep both and say so |
-| **Embedding drift** | An entity stops matching itself | Conservative exemplar policy: `> 0.85` to learn, `< 0.95` to add, cap 8, evict most redundant |
-| **Boom bumped** | Every position off by a constant | Coherent-marker-shift detection + auto-recalibrate |
-| **Partial covering** | 30% overlap, H2 does not fire, H4 marks it lost | `COVER_MIN` is tunable; if the visible remainder still matches, H1 catches it and it was never a disappearance |
-| **Placing onto a hidden object's spot** | New object lands on a `HIDDEN` entity's footprint | Resolve containment against topmost *visible* entity only; the hidden entity keeps its parent |
-| **Omni invents a location** | Confident answer with no grounding | Constraining system prompt; log every tool call beside its spoken answer |
+| **Exposure drift** | refdiff slowly fills with noise; embeddings shift | Lock exposure; brightness-level the reference before diffing |
+| **Camera moved** | Everything reads as changed at once | ArUco re-solve per settle, or recalibrate hotkey |
+| **Empty Observation on detector failure** | Whole desk marked `LOST` in one tick | Detector raises; settle loop skips and keeps the old settled frame |
+| **Segmenting outside changed regions** | Every object "disappears" each settle | `missingEntities` gating |
+| **Mask flicker** | One object becomes two entities | Two-settle confirmation before minting |
+| **Touching objects** | refdiff merges them into one blob | Move them apart for the demo, or switch to chroma/SAM |
+| **Identical objects** | Two pens swap identity | Spatial prior; on ambiguity keep both and say so |
+| **Loose boxes vs `COVER_MIN`** | Covering not detected | Lower to 0.4, tiebreak on centroid distance |
+| **Label arrives late** | `IN` misread as `UNDER` for ~4 s | Default `isContainer=False`; cosmetic only |
+| **Omni invents a location** | Confident answer with no grounding | Constraining prompt; log every tool call beside its answer |
 
 ### Limitations worth stating plainly
 
-Naming these in the write-up reads as better engineering than presenting the system as
-universal:
-
-- Objects moved while a body occludes the whole mat are unresolvable.
+- Objects moved while a body occludes the whole surface are unresolvable.
 - Stacking beyond two or three levels is untested; footprint overlap gets noisier with depth.
-- The system cannot distinguish two agents, so "who moved it" means "a person moved it".
-- A cold start with a non-empty desk mints new entities for everything already there; prior
-  identities are not recoverable.
+- One agent only, so "who moved it" means "a person moved it".
+- A cold start with a non-empty desk mints new entities for everything; prior identities are not
+  recoverable.
