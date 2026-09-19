@@ -10,34 +10,35 @@ import cv2
 #which is a weaker answer, not a wrong one.
 
 MIN_AREA_PX = 4000 #Under this a border blob is a shadow or a sleeve, not an arm
-MOTION_DELTA = 25 #Grey difference that counts as moving, same units as Config.pixel_delta
 EDGE_PX = 6 #How close to the border counts as touching it
 HAND_PX = 70 #Half-width of the footprint a hand sweeps, around the far tip
 
 
-def touchesBorder(box: tuple[int, int, int, int], shape) -> bool:
-    h, w = shape[:2]
-    return (box[0] <= EDGE_PX or box[1] <= EDGE_PX
-            or box[2] >= w - EDGE_PX or box[3] >= h - EDGE_PX)
+def touchesBorder(box: tuple[int, int, int, int], bounds: tuple[int, int, int, int]) -> bool:
+    #`bounds` is the region the detector can see: the whole frame for refdiff, the mat for
+    #anything that only understands the surface.
+    return (box[0] <= bounds[0] + EDGE_PX or box[1] <= bounds[1] + EDGE_PX
+            or box[2] >= bounds[2] - EDGE_PX or box[3] >= bounds[3] - EDGE_PX)
 
 
-def borderBlob(mask: np.ndarray, minArea: int = MIN_AREA_PX):
+def borderBlob(mask: np.ndarray, bounds: tuple[int, int, int, int],
+               minArea: int = MIN_AREA_PX):
     #(blob mask, stats row) for the largest edge-touching component, or None. Anything
     #wholly interior is an object that moved, not something reaching in over the edge.
     n, lbl, stats, _c = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
     best, bestArea = 0, minArea
     for i in range(1, n):
         x, y, bw, bh, area = stats[i]
-        if area >= bestArea and touchesBorder((x, y, x + bw, y + bh), mask.shape):
+        if area >= bestArea and touchesBorder((x, y, x + bw, y + bh), bounds):
             best, bestArea = i, area
     return (lbl == best, stats[best]) if best else None
 
 
-def enteringEdge(stats, shape) -> str:
+def enteringEdge(stats, bounds: tuple[int, int, int, int]) -> str:
     #Which border the arm crossed. The one the blob is hard against is the shoulder side.
     x, y, w, h = stats[0], stats[1], stats[2], stats[3]
-    frameH, frameW = shape[:2]
-    gaps = {"left": x, "top": y, "right": frameW - (x + w), "bottom": frameH - (y + h)}
+    gaps = {"left": x - bounds[0], "top": y - bounds[1],
+            "right": bounds[2] - (x + w), "bottom": bounds[3] - (y + h)}
     return min(gaps, key=gaps.get)
 
 
@@ -59,11 +60,18 @@ class AgentTracker:
     #One burst of motion's worth of hand path, reset after every settle. `present` is a
     #different question from anything update() can answer -- it asks whether the hand is
     #STILL there once everything has stopped -- so analyse() sets it from the settled frame.
-    def __init__(self, minArea: int = MIN_AREA_PX, handPx: int = HAND_PX,
-                 delta: int = MOTION_DELTA):
+    #
+    #The blob comes from the detector's FOREGROUND, not from the frame-to-frame difference
+    #the motion gate built. An arm reaching in mostly translates along its own length, so
+    #from one frame to the next it barely differs except at the fingertips, and those
+    #crescents touch no border and are too small to be an arm. Against the empty desk the
+    #whole limb is one large region crossing the edge, every frame it is in shot.
+    def __init__(self, maskOf, bounds: tuple[int, int, int, int],
+                 minArea: int = MIN_AREA_PX, handPx: int = HAND_PX):
+        self.maskOf = maskOf
+        self.bounds = bounds
         self.minArea = minArea
         self.handPx = handPx
-        self.delta = delta
         self.path: list[Rect] = []
         self.present = False
 
@@ -71,12 +79,13 @@ class AgentTracker:
         self.path, self.present = [], False
 
     def update(self, frame: np.ndarray, diff: np.ndarray, H: np.ndarray):
-        #Called on motion frames only, with the frame-to-frame difference the gate built.
-        found = borderBlob(diff > self.delta, self.minArea)
+        #Called on motion frames only. `diff` is what the gate already computed; the
+        #foreground is what actually shows an arm.
+        found = borderBlob(self.maskOf(frame), self.bounds, self.minArea)
         if found is None:
             return
         blob, stats = found
-        x, y = farTip(blob, enteringEdge(stats, diff.shape))
+        x, y = farTip(blob, enteringEdge(stats, self.bounds))
         self.path.append(rectPxToMm(H, (x - self.handPx, y - self.handPx,
                                         x + self.handPx, y + self.handPx)))
 

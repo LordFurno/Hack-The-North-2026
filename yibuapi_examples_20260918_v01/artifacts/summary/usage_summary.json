@@ -1,27 +1,42 @@
 {
   "schema_version": "yibu_usage_summary_v1",
-  "generated_at_utc": "2026-09-19T15:02:33.099081+00:00",
+  "generated_at_utc": "2026-09-19T17:44:47.581933+00:00",
   "source": {
-    "path": "/home/personion/Documents/Hack-The-North-2026/yibuapi_examples_20260918_v01/artifacts/yibu_api_calls.jsonl",
-    "bytes": 1448,
-    "sha256": "ff5a6be06089496cf58618811a56da5937b99d5ba7b752e74a195414530fa8d1",
-    "unique_call_ids": 2,
+    "path": "C:\\Users\\lordf\\Downloads\\Hack-The-North-2026\\yibuapi_examples_20260918_v01\\artifacts\\yibu_api_calls.jsonl",
+    "bytes": 2879,
+    "sha256": "afa8ba371b06368bc7b49a0261995190c17fcf4f7fb0d9722279386c2fef136a",
+    "unique_call_ids": 4,
     "duplicate_rows_ignored": 0
   },
   "accounting_note": "Missing token values are unknown, not zero; totals only sum reported values.",
   "totals": {
-    "calls": 2,
-    "ok": 2,
+    "calls": 4,
+    "ok": 4,
     "failed": 0,
     "usage_missing_calls": 0,
-    "input_tokens": 4464,
-    "output_tokens": 458,
-    "total_tokens": 4922,
+    "input_tokens": 4714,
+    "output_tokens": 484,
+    "total_tokens": 5198,
     "input_tokens_missing_calls": 0,
     "output_tokens_missing_calls": 0,
     "total_tokens_missing_calls": 0
   },
   "groups": [
+    {
+      "model": "qwen3.5-omni-flash",
+      "key_suffix": "...0brU",
+      "purpose": "spatial_memory_label",
+      "calls": 2,
+      "ok": 2,
+      "failed": 0,
+      "usage_missing_calls": 0,
+      "input_tokens": 250,
+      "output_tokens": 26,
+      "total_tokens": 276,
+      "input_tokens_missing_calls": 0,
+      "output_tokens_missing_calls": 0,
+      "total_tokens_missing_calls": 0
+    },
     {
       "model": "qwen3.5-omni-plus",
       "key_suffix": "...0brU",

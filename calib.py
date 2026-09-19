@@ -39,23 +39,40 @@ CALIB_PATH = "calib.json"
 REFERENCE_PATH = "reference.png"
 
 CAM_WIDTH, CAM_HEIGHT = 1280, 720
-EXPOSURE = -6 #Backend-dependent and often meaningless, but harmless where it is
+EXPOSURE = -6 #A starting point only. What is right depends entirely on the room: on one
+              #camera here -6 lands at mean 21 of 255 and -4 at 69. calibrate.py lets you
+              #pick, and saves the choice, because a reference frame taken at one exposure
+              #is worthless against frames captured at another.
+SETTLE_READS = 15 #Frames to throw away while whatever is still automatic finds its level
 
 
-def openCamera(index: int = 0, width: int = CAM_WIDTH, height: int = CAM_HEIGHT) -> cv2.VideoCapture:
+def openCamera(index: int = 0, width: int = CAM_WIDTH, height: int = CAM_HEIGHT,
+               exposure: float | None = EXPOSURE) -> cv2.VideoCapture:
     #Auto anything is a slow leak into the detector: exposure drift fills refdiff with
-    #noise and shifts every embedding. These are silently ignored by plenty of backends,
-    #which is exactly why level() exists as well.
+    #noise and shifts every embedding. These are silently ignored by plenty of backends
+    #-- CAP_PROP_AUTO_EXPOSURE reads back -1 on both cameras here -- which is exactly why
+    #level() exists as well. `exposure=None` leaves the camera's own choice alone.
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) #DSHOW opens in milliseconds on Windows
     if not cap.isOpened():
         raise SystemExit(f"no camera at index {index}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) #0.25 = manual on most backends
-    cap.set(cv2.CAP_PROP_EXPOSURE, EXPOSURE)
+    if exposure is not None:
+        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
     cap.set(cv2.CAP_PROP_AUTO_WB, 0)
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    for _ in range(SETTLE_READS):
+        cap.read()
     return cap
+
+
+def cameraSettings(cap: cv2.VideoCapture, index: int) -> dict:
+    #What live.py has to reproduce for the saved reference frame to mean anything.
+    return {"index": index,
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "exposure": cap.get(cv2.CAP_PROP_EXPOSURE)}
 
 
 def level(ref: np.ndarray, now: np.ndarray) -> np.ndarray:
@@ -150,11 +167,11 @@ def solveHomography(frame: np.ndarray) -> np.ndarray | None:
 # ---- saved calibration --------------------------------------------------
 
 def saveCalib(H: np.ndarray, reference: np.ndarray, path: str = CALIB_PATH,
-              refPath: str = REFERENCE_PATH):
+              refPath: str = REFERENCE_PATH, camera: dict | None = None):
     cv2.imwrite(refPath, reference)
     with open(path, "w") as f:
         json.dump({"H": np.asarray(H).tolist(), "mat_bounds": list(MAT_BOUNDS),
-                   "reference": refPath}, f, indent=1)
+                   "reference": refPath, "camera": camera or {}}, f, indent=1)
 
 
 def loadCalib(path: str = CALIB_PATH) -> tuple[np.ndarray, np.ndarray]: #(H, reference)
@@ -168,6 +185,15 @@ def loadCalib(path: str = CALIB_PATH) -> tuple[np.ndarray, np.ndarray]: #(H, ref
         print(f"warning: {path} was saved against mat bounds {data['mat_bounds']}, "
               f"code says {list(MAT_BOUNDS)}. Every threshold is in those units")
     return np.array(data["H"], dtype=float), reference
+
+
+def loadCamera(path: str = CALIB_PATH) -> dict:
+    #The camera the reference frame was taken with. Reopening at a different exposure
+    #makes the whole desk read as changed, which is the worst failure the system has.
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f).get("camera") or {}
 
 
 def haveCalib(path: str = CALIB_PATH) -> bool:

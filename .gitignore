@@ -3,3 +3,12 @@ venv/
 .venv/
 .env
 .pytest_cache/
+
+# Per-machine calibration: a homography and an empty-desk frame for one camera
+# in one position. Committing them would hand the next person the wrong desk.
+calib.json
+reference.png
+
+# Run output: keyframes, crops and annotated replays
+snaps/
+replay/

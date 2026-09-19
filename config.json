@@ -1,7 +1,7 @@
 {
  "pixel_delta": 25,
  "motion_frac": 0.002,
- "settle_frames": 15,
+ "settle_frames": 8,
  "min_region_px": 400,
  "min_object_px": 900,
  "ref_delta": 30,

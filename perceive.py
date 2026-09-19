@@ -1,5 +1,5 @@
 from core import Detection, Observation, Rect
-from calib import level, pxToMm, rectPxToMm, solveHomography
+from calib import MAT_BOUNDS, level, pxToMm, rectPxToMm, solveHomography
 from agent import touchesBorder
 from dataclasses import asdict, dataclass
 from typing import Protocol
@@ -55,7 +55,13 @@ class DetectorError(Exception):
 
 
 class Detector(Protocol):
+    #`mask` and `bounds` are not part of the contract the world model depends on -- that
+    #is `detect` alone -- but the agent tracker needs a foreground mask and the region the
+    #detector can actually see, and the detector is the only thing that knows either.
+    bounds: BoxPx
+
     def detect(self, frame: np.ndarray, regions: list[BoxPx]) -> list[BoxPx]: ...
+    def mask(self, frame: np.ndarray) -> np.ndarray: ...
 
 
 # ---- pixels -------------------------------------------------------------
@@ -90,6 +96,21 @@ def changedRegions(prevSettled: np.ndarray, now: np.ndarray, cfg: Config) -> lis
     return components(mask, cfg.min_region_px)
 
 
+def matMaskPx(H: np.ndarray, shape) -> tuple[np.ndarray, BoxPx]: #(mask, its bounding box)
+    #MAT_BOUNDS pushed back through H. Anything outside it is not the desk, so it is not
+    #an object however different from the surface it looks.
+    x0, y0, x1, y1 = MAT_BOUNDS
+    inv = np.linalg.inv(H)
+    quad = []
+    for mm in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        q = inv @ np.array([mm[0], mm[1], 1.0])
+        quad.append((q[0] / q[2], q[1] / q[2]))
+    mask = np.zeros(shape[:2], np.uint8)
+    cv2.fillPoly(mask, [np.int32(quad)], 1)
+    bx, by, bw, bh = cv2.boundingRect(np.int32(quad))
+    return mask, (bx, by, bx + bw, by + bh)
+
+
 def changedFraction(regions: list[BoxPx], shape) -> float:
     #Boxes overlap, so sum of areas overstates -- which is the safe direction for a guard
     #that only ever has to notice "suspiciously much of the frame at once".
@@ -100,37 +121,46 @@ def changedFraction(regions: list[BoxPx], shape) -> float:
 # ---- detectors ----------------------------------------------------------
 
 class RefDiffDetector: #Primary. Whatever is not the empty desk is an object
+    #Differenced per channel, not on grey. A terracotta mug and a green mat can sit four
+    #grey levels apart while being 150 apart in blue, and thresholding their luminance
+    #shreds a patterned object into its own light and dark patches.
     def __init__(self, reference: np.ndarray, cfg: Config):
         if reference is None:
             raise DetectorError("no reference frame: run calibrate.py and press r")
-        self.reference = gray(reference)
+        self.reference = reference
         self.cfg = cfg
+        h, w = reference.shape[:2]
+        self.bounds = (0, 0, w, h) #The reference covers the whole frame, surround included
+
+    def mask(self, frame: np.ndarray) -> np.ndarray:
+        if frame.shape != self.reference.shape:
+            raise DetectorError(f"frame {frame.shape} does not match "
+                                f"reference {self.reference.shape}")
+        d = cv2.absdiff(frame, level(self.reference, frame))
+        return morph((d.max(axis=2) > self.cfg.ref_delta).astype(np.uint8), self.cfg.morph_px)
 
     def detect(self, frame: np.ndarray, regions: list[BoxPx]) -> list[BoxPx]:
-        g = gray(frame)
-        if g.shape != self.reference.shape:
-            raise DetectorError(f"frame {g.shape} does not match reference {self.reference.shape}")
-        if changedFraction(regions, g.shape) > self.cfg.max_changed_frac:
+        if changedFraction(regions, frame.shape) > self.cfg.max_changed_frac:
             raise DetectorError("most of the frame changed at once, camera probably moved")
-
-        fg = morph((cv2.absdiff(g, level(self.reference, g)) > self.cfg.ref_delta).astype(np.uint8),
-                   self.cfg.morph_px)
-        return [b for b in components(fg, self.cfg.min_object_px)
+        return [b for b in components(self.mask(frame), self.cfg.min_object_px)
                 if any(intersects(b, r) for r in regions)]
 
 
 class ChromaDetector: #Optional. Only worth it on a known-hue surface, and then it is better
     #Hue distance, ignoring the value channel, so a cast shadow keeps the surface's hue and
     #is rejected for free. Refdiff has no way to tell a shadow from a thin dark object.
-    def __init__(self, cfg: Config):
+    #Everything off the surface reads as foreground here, so this one needs the mat mask:
+    #without it the whole surround is one enormous object touching every changed region.
+    def __init__(self, cfg: Config, H: np.ndarray, shape):
         self.cfg = cfg
+        self.matMask, self.bounds = matMaskPx(H, shape)
 
     def mask(self, frame: np.ndarray) -> np.ndarray:
         h, s, _v = cv2.split(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV))
         dh = np.minimum(np.abs(h.astype(int) - self.cfg.chroma_hue),
                         180 - np.abs(h.astype(int) - self.cfg.chroma_hue))
-        return morph((~((dh < self.cfg.chroma_tol) & (s > self.cfg.chroma_sat))).astype(np.uint8),
-                     self.cfg.morph_px)
+        fg = (~((dh < self.cfg.chroma_tol) & (s > self.cfg.chroma_sat))).astype(np.uint8)
+        return morph(fg * self.matMask, self.cfg.morph_px)
 
     def detect(self, frame: np.ndarray, regions: list[BoxPx]) -> list[BoxPx]:
         if changedFraction(regions, frame.shape) > self.cfg.max_changed_frac:
@@ -170,14 +200,15 @@ def analyse(prevSettled: np.ndarray, now: np.ndarray, det: Detector, H: np.ndarr
     changed = changedRegions(prevSettled, now, cfg)
     boxes = det.detect(now, changed)
 
-    #A box still touching the frame border once everything has stopped is an arm reaching
-    #in, not an object on the desk. Dropping it answers agent_present -- the question H3
-    #actually asks, which is whether the hand is there NOW -- and stops the arm minting an
-    #entity of its own. Nothing else in the system would ever get rid of that entity.
-    reaching = [b for b in boxes if touchesBorder(b, now.shape)]
+    #A box still touching the edge of what the detector can see, once everything has
+    #stopped, is an arm reaching in rather than an object on the desk. Dropped either way,
+    #tracker or no tracker, because nothing in the system could ever remove the entity it
+    #would otherwise mint. With a tracker it also answers agent_present -- the question H3
+    #actually asks, which is whether the hand is there NOW.
+    reaching = [b for b in boxes if touchesBorder(b, det.bounds)]
+    boxes = [b for b in boxes if b not in reaching]
     if agent is not None:
         agent.present = bool(reaching)
-        boxes = [b for b in boxes if b not in reaching]
 
     stamp = f"{ts:.3f}".replace(".", "_")
     dets = []
@@ -192,6 +223,17 @@ def analyse(prevSettled: np.ndarray, now: np.ndarray, det: Detector, H: np.ndarr
                        changed=[rectPxToMm(H, r) for r in changed],
                        agent_swept=agent.swept_mm() if agent else [],
                        agent_present=agent.present if agent else False)
+
+
+def histEmbed(frame: np.ndarray, box: BoxPx) -> np.ndarray:
+    #NOT re-identification, and no substitute for DINO: a hue-saturation histogram tells
+    #two differently coloured objects apart and nothing more. It exists so the loop can be
+    #run and tuned on a machine with no torch on it, where the alternative is a constant
+    #vector that scores 0.0 against everything and mints a new entity every settle.
+    hsv = cv2.cvtColor(frame[box[1]:box[3], box[0]:box[2]], cv2.COLOR_BGR2HSV)
+    h = cv2.calcHist([hsv], [0, 1], None, [24, 4], [0, 180, 0, 256]).flatten()
+    n = float(np.linalg.norm(h))
+    return h / n if n else h #L2, so a dot is a cosine, same as the real embedder
 
 
 def observationJson(obs: Observation) -> dict:
@@ -212,7 +254,7 @@ def run(cap, det: Detector, sink, cfg: Config, H: np.ndarray, agent=None,
         embed=None, clock=time.time, resolveH: bool = True, root: str = SNAP_DIR):
     #The trigger is motion STOPPING, not hand detection: frame difference over a threshold,
     #then quiet for ~500 ms. No model, no assumptions, trivially reliable.
-    embed = embed or (lambda frame, box: np.zeros(1, dtype=float))
+    embed = embed or histEmbed
     prev, quiet, settled = None, 0, None
 
     while True:

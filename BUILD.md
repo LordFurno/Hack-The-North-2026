@@ -10,17 +10,29 @@ Read `spec.md` first. Sections marked **[BUILT]** already exist.
 
 ## Already built
 
-`core.py` · `world.py` · `resolve.py` · `verify.py` · `fake.py` · `calib.py` (pure half) ·
+`core.py` · `world.py` · `resolve.py` · `verify.py` · `fake.py` · `calib.py` ·
 `identity.py` (matcher + Embedder) · `service.py` · dashboard · `synth.py` · tests
+
+**Phases A and C are now written**, and the whole of A plus C1–C6 runs green against
+`synth.mp4`: `pytest -q` covers steps 1–6 and 8 of the test table below end to end, on both
+detectors. Step 7 (the palmed falsification) is covered at the world-model level by
+`tests/test_script.py`, because the fixture's script has no palm-out beat.
+
+Two things the fixture cannot answer, and a desk can:
+
+- **Phase B is still open.** Nothing below has been run against real objects under a real
+  webcam, which is the only place the thresholds in `config.json` get their real values.
+- **The flicker guard is off.** `confirm_settles: 0` in `config.json`. Set it to `2` the
+  first time phantom entities appear; it is built, tested and one number away.
 
 ---
 
-# Phase A — minimum live loop (~90 min)
+# Phase A — minimum live loop (~90 min) — **written**
 
 Three steps, then you're testing on real objects. Deliberately skips the agent tracker,
 labelling, flicker guard and ArUco — all of those degrade gracefully or are cosmetic.
 
-## A1. Calibration + capture — 25 min
+## A1. Calibration + capture — 25 min — built
 
 > Read spec.md §3 and §4. Add to calib.py: openCamera (locks exposure, white balance and
 > autofocus via CAP_PROP_*), clickCorners for the homography, level() for brightness matching,
@@ -32,7 +44,7 @@ labelling, flicker guard and ArUco — all of those degrade gracefully or are co
 **Test it:** clear your desk, run it, click four corners, save. Verify `pxToMm` on a known
 point lands roughly where you'd expect.
 
-## A2. RefDiff detector + settle loop — 45 min
+## A2. RefDiff detector + settle loop — 45 min — built
 
 The whole of perception, minus everything optional.
 
@@ -46,7 +58,7 @@ The whole of perception, minus everything optional.
 > agent_present=False for now. Add a --video flag so it runs on a file as well as a camera —
 > same code path, no live-only branch.
 
-## A3. Wire it live — 20 min
+## A3. Wire it live — 20 min — built
 
 > Write live.py: loads calib.json, opens the camera, runs perceive.run() with a sink that POSTs
 > each Observation to the service. Add a `--local` flag that skips HTTP and calls settle()
@@ -70,7 +82,7 @@ Work through these in order and write down what breaks:
 | 5 | Slide the box, mug still under | mug's dot travels with the box |
 | 6 | Lift the box away | mug `REVEALED`, confidence back to 1.0 |
 | 7 | Palm the mug out while covering, then lift | `BELIEF_FALSIFIED`, red row |
-| 8 | Take the mug off the desk entirely | `UNRESOLVED` (H3 is stubbed, so no `LEFT_DESK` yet) |
+| 8 | Take the mug off the desk entirely | `LEFT_DESK`, cause `agent` (C2 is built, so H3 fires) |
 
 Steps 4–7 are the demo. If those work, everything after this is polish.
 
@@ -92,9 +104,9 @@ Don't pre-empt these. Come back to this list *after* testing, and only do the on
 
 ---
 
-# Phase C — hardening, in likely-need order
+# Phase C — hardening, in likely-need order — **written**
 
-## C1. Flicker guard — 20 min
+## C1. Flicker guard — 20 min — built, off by default
 
 Almost certainly your first real problem once live.
 
@@ -102,7 +114,7 @@ Almost certainly your first real problem once live.
 > consecutive settles before settle() mints an entity from it; key on a coarse position bucket.
 > Test: a detection present in one settle and gone the next mints nothing.
 
-## C2. Agent tracker — 30 min
+## C2. Agent tracker — 30 min — built
 
 Unlocks H3, which turns "I lost track of it" into "you took it off the desk".
 
@@ -110,7 +122,7 @@ Unlocks H3, which turns "I lost track of it" into "you took it off the desk".
 > edge-touching blob heuristic and far-tip extraction. Wire into perceive.py's motion branch,
 > replacing the stub.
 
-## C3. Async labelling — 30 min
+## C3. Async labelling — 30 min — built
 
 Turns every entity from "unknown" into something the voice layer can say.
 
@@ -119,19 +131,19 @@ Turns every entity from "unknown" into something the voice layer can say.
 > and tracked immediately with label="unknown" — tracking never blocks on the network. Cache
 > forever, never re-call. Push a state delta on /stream when the label lands.
 
-## C4. Rewind — 25 min
+## C4. Rewind — 25 min — built
 
 > Snapshot the full world state after every settle into a list alongside events. Add GET
 > /snapshots and a scrubber to the dashboard that indexes it directly — do not invert the event
 > log. Scrubbing shows both the map at that moment and the frame_ref keyframe it was believed
 > from.
 
-## C5. ArUco + per-settle re-solve — 30 min
+## C5. ArUco + per-settle re-solve — 30 min — built
 
 > Add findMarkers and solveHomography to calib.py per spec.md §4. Re-solve on every settle,
 > keeping the previous H when fewer than 4 markers are visible. Makes a bumped camera free.
 
-## C6. replay.py and tune.py — 40 min
+## C6. replay.py and tune.py — 40 min — built
 
 > replay.py: run the settle loop over a recorded video, writing an annotated JPEG per settle
 > (boxes, entity ids, match scores, status) and an events.jsonl.

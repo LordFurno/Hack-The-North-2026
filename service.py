@@ -3,9 +3,11 @@ from core import (AGENT_ID, DESK, Detection, Entity, Event, EventKind,
 from calib import MAT_BOUNDS, quadrant
 from world import World
 from resolve import settle
+from perceive import Config, SNAP_DIR
 import fake
+import omni
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 import numpy as np
 import argparse, asyncio, os, re, threading, time
@@ -17,6 +19,7 @@ import uvicorn
 HISTORY_LIMIT = 20
 STREAM_HZ = 5.0 #State is small enough to re-send whole, so decay is watchable
 UI_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+SNAP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), SNAP_DIR)
 
 PREP = {Relation.IN: "in", Relation.UNDER: "under",
         Relation.ON: "on", Relation.HELD: "held by"}
@@ -31,8 +34,10 @@ STOP_WORDS = {"the", "a", "an", "my", "our", "your", "this", "that", "those",
 
 WORLD = World()
 LOCK = threading.Lock() #The fake feed and out-of-process perception write from other threads
+CONFIG = Config.load() #Only confirm_settles matters on this side of the wire
 
 app = FastAPI(title="spatial memory")
+omni.attach(WORLD, LOCK) #No API key, no labelling, no difference to anything else
 
 
 # ---- phrasing -----------------------------------------------------------
@@ -143,6 +148,21 @@ def stateJson(world: World, now: float) -> dict:
             "entities": [entityJson(world, e, now) for e in world.entities.values()]}
 
 
+def recordSnapshot(world: World, obs: Observation):
+    #Rewind indexes this list directly. Inverting the event log to reconstruct a past
+    #state is tempting and it is a trap: positions are resolved here, at the moment they
+    #were true, because a parent that moves later would otherwise rewrite history.
+    world.snapshots.append(dict(stateJson(world, obs.ts),
+                                frame_ref=obs.frame_ref, seq=len(world.events)))
+
+
+def applyObservation(world: World, obs: Observation) -> list[Event]:
+    #The one write path, shared by the HTTP endpoint and the fake feed.
+    events = settle(world, obs, CONFIG.confirm_settles)
+    recordSnapshot(world, obs)
+    return events
+
+
 def streamJson(world: World, now: float, since: int) -> dict:
     #Whole state plus the events the client has not had yet. Confidence decays
     #between settles, so a client that only listened for events would watch a
@@ -222,7 +242,7 @@ def history(world: World, query: str, limit: int = HISTORY_LIMIT) -> dict:
 def postObservation(payload: dict):
     obs = observationFrom(payload)
     with LOCK:
-        events = settle(WORLD, obs)
+        events = applyObservation(WORLD, obs)
         return {"accepted": True, "frame_ref": obs.frame_ref,
                 "events": [eventJson(WORLD, ev) for ev in events]}
 
@@ -246,6 +266,22 @@ def getEvents(since: float = 0.0):
     with LOCK:
         return {"since": since, "ts": time.time(),
                 "events": [eventJson(WORLD, ev) for ev in WORLD.events if ev.ts > since]}
+
+
+@app.get("/snapshots")
+def getSnapshots(since: int = 0):
+    with LOCK:
+        return {"count": len(WORLD.snapshots), "since": since,
+                "snapshots": WORLD.snapshots[since:]}
+
+
+@app.get("/snaps/{name}")
+def getSnap(name: str):
+    #The keyframe an Event was believed from. Basename only: the path comes off the wire.
+    path = os.path.join(SNAP_ROOT, os.path.basename(name))
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="no such keyframe")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.websocket("/stream")
@@ -295,7 +331,7 @@ def feedFake(speed: float = 1.0):
     #ends, which is the point: the endpoints stay interesting with no camera attached.
     for obs in fake.stream(speed):
         with LOCK:
-            events = settle(WORLD, obs)
+            events = applyObservation(WORLD, obs)
         print(f"[fake] {obs.frame_ref} {', '.join(ev.kind.value for ev in events) or 'nothing'}")
     print("[fake] script exhausted, world is live and decaying")
 

@@ -100,9 +100,10 @@ def resolve(world: World, e: Entity, obs: Observation,
                                 "note": h.note} for h in rest])
 
 
-def settle(world: World, obs: Observation) -> list[Event]:
+def settle(world: World, obs: Observation, confirm: int = 0) -> list[Event]:
     #One settle, start to finish: match what is there, resolve what is not, then
-    #test the beliefs that anything moving has put in reach.
+    #test the beliefs that anything moving has put in reach. `confirm` is the flicker
+    #guard's two-settle rule, off by default.
     events: list[Event] = []
     matches: dict[str, Detection] = {}
     confirmed: set[str] = set() #Seen where we already believed it was, nothing to explain
@@ -114,7 +115,9 @@ def settle(world: World, obs: Observation) -> list[Event]:
     for det in obs.detections:
         m = match(world, det)
         if m.entity is None:
-            e = world.mint(det, obs.ts)
+            e = world.provisional(det, obs.ts, confirm)
+            if e is None:
+                continue #Seen once. An entity is forever, so it had better be real first
             seen.append(e)
             confirmed.add(e.id)
             events.append(Event(ts=obs.ts, entity=e.id, kind=EventKind.APPEARED,
@@ -151,5 +154,6 @@ def settle(world: World, obs: Observation) -> list[Event]:
     for occluder in toVerify:
         events.extend(verifyChildren(world, occluder, obs))
 
+    world.expireProvisional([d.centroid for d in obs.detections])
     world.events.extend(events)
     return events

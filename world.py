@@ -4,6 +4,7 @@ from calib import overlapFraction
 
 COVER_MIN = 0.5 #Fraction of the hidden thing's footprint that counts as covered
 CHANGED_MIN = 0.2 #Footprint overlap with a changed region that makes an entity worth resolving
+PROVISIONAL_MM = 40.0 #Flicker guard bucket: "roughly the same position" in one number
 
 HALF_LIFE = { #seconds
     Status.HIDDEN: 3600.0, #Well-founded: the occluder is right there
@@ -16,7 +17,9 @@ class World:
     def __init__(self):
         self.entities: dict[str, Entity] = {}
         self.events: list[Event] = []
-        self._provisional: dict[int, tuple[Detection, int]] = {} #Flicker guard, filled by perception
+        self.snapshots: list[dict] = [] #Rewind: whole state after every settle, alongside events
+        self.onMint = None #Called with (entity, detection) at birth. Labelling hangs off this
+        self._provisional: dict[tuple[int, int], int] = {} #Flicker guard, filled by settle()
         self.entities[AGENT_ID] = Entity(id=AGENT_ID, label="hand", isAgent=True)
 
     # ---- geometry -------------------------------------------------------
@@ -65,7 +68,36 @@ class World:
         e.bank.vectors.append(det.embedding) #Birth view, no match score to weigh it against
         self.entities[e.id] = e
         placeOn(self, e, det.centroid)
+        if self.onMint: #Fire and forget. Tracking never waits on the network
+            self.onMint(e, det)
         return e
+
+    # ---- flicker guard --------------------------------------------------
+
+    def provisional(self, det: Detection, now: float, settles: int) -> Entity | None:
+        #A mask that flickers for one settle would otherwise mint an entity that nothing
+        #can ever remove, so make a detection prove it is still there before believing it.
+        #Zero settles is the immediate mint, and the default: the guard costs a settle of
+        #lag before a placed object reaches the map, which is worth paying only once
+        #phantoms actually show up.
+        if settles <= 0:
+            return self.mint(det, now)
+
+        key = bucketOf(det.centroid)
+        for k in neighbours(key): #Nine buckets, so a detection on a boundary cannot
+            if k in self._provisional: #jitter its way out of ever existing
+                seen = self._provisional.pop(k) + 1
+                if seen >= settles:
+                    return self.mint(det, now)
+                self._provisional[key] = seen
+                return None
+        self._provisional[key] = 1
+        return None
+
+    def expireProvisional(self, centroids: list[tuple[float, float]]):
+        #Anything with no detection anywhere near it this settle was flicker. Drop it.
+        keep = {k for pt in centroids for k in neighbours(bucketOf(pt))}
+        self._provisional = {k: n for k, n in self._provisional.items() if k in keep}
 
     # ---- decay ----------------------------------------------------------
 
@@ -82,6 +114,14 @@ class World:
             if occ.status == Status.VISIBLE and occ.last_confirmed >= e.last_confirmed:
                 c = max(c, 0.8)
         return c
+
+
+def bucketOf(pt: tuple[float, float]) -> tuple[int, int]:
+    return (int(pt[0] // PROVISIONAL_MM), int(pt[1] // PROVISIONAL_MM))
+
+
+def neighbours(key: tuple[int, int]) -> list[tuple[int, int]]:
+    return [(key[0] + dx, key[1] + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
 
 
 def surfaceUnder(world: World, pt: tuple[float, float], ignore: str = "") -> str:

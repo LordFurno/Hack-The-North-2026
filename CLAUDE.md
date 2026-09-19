@@ -6,17 +6,23 @@ thresholds, and module boundaries.
 ## Layout
 Flat, at repo root. No packages, no src/ dir.
   core.py      types and enums — FROZEN, see below
-  world.py     World: geometry, structure, reparent, decay
+  world.py     World: geometry, structure, reparent, decay, flicker guard
   resolve.py   H1-H4 hypotheses + resolve()
   verify.py    reveal path, falsified beliefs
-  calib.py     homography, mat bounds, overlap_fraction
-  perceive.py  settle loop + analysis pass
+  calib.py     mat geometry + homography, camera, reference frame, ArUco
+  perceive.py  detectors, settle loop, analysis pass, Config
   identity.py  embedder, matcher, exemplar bank
   agent.py     AgentTracker
+  omni.py      async labelling (label + isContainer), one call per new entity
   fake.py      scripted observation generator
   synth.py     synthetic fixture video renderer
-  replay.py    run the pipeline over a video file
-  service.py   FastAPI: /observation /state /events /stream
+  calibrate.py one-off: clicked corners + empty-desk reference -> calib.json
+  live.py      camera -> perceive.run -> POST /observation (or --local)
+  replay.py    run the pipeline over a video file, annotated JPEG per settle
+  tune.py      trackbars for the thresholds, s dumps config.json
+  service.py   FastAPI: /observation /state /events /stream /snapshots /snaps
+  ui.html      dashboard: desk map, event timeline, rewind scrubber
+  config.json  thresholds. calib.json + reference.png are per-machine, untracked
   tests/
 
 ## Hard rules

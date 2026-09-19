@@ -259,6 +259,55 @@ section {
 }
 
 .row.falsified .note { color: #fca5a5; }
+
+/* ---- rewind ---------------------------------------------------------- */
+
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+footer.rewound { border-top-color: var(--unres); color: var(--unres); }
+
+#scrub { flex: 1; accent-color: var(--vis); }
+footer.rewound #scrub { accent-color: var(--unres); }
+
+#live-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  cursor: pointer;
+  visibility: hidden;
+}
+
+footer.rewound #live-btn {
+  visibility: visible;
+  border-color: var(--unres);
+  color: var(--unres);
+}
+
+/* The keyframe an Event was believed from, beside the map it produced. */
+.keyframe {
+  width: 190px;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 12px;
+  border-left: 1px dashed var(--line);
+}
+
+.map-body.rewound .keyframe { display: flex; }
+.keyframe img { width: 100%; border: 1px solid var(--line); border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -275,8 +324,13 @@ section {
 <main>
   <section id="map-pane">
     <div class="pane-head">desk <b id="dims"></b></div>
-    <div class="map-body">
+    <div class="map-body" id="map-body">
       <div class="mat-wrap"><svg id="mat" preserveAspectRatio="xMidYMid meet"></svg></div>
+      <aside class="keyframe" id="keyframe">
+        <div class="strip-head">believed from</div>
+        <img id="keyframe-img" alt="">
+        <span id="keyframe-name"></span>
+      </aside>
       <aside class="strip" id="strip"></aside>
     </div>
   </section>
@@ -286,6 +340,13 @@ section {
     <div id="timeline"></div>
   </section>
 </main>
+
+<footer id="rewind">
+  <span>rewind</span>
+  <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+  <span id="scrub-at">live</span>
+  <button id="live-btn">back to live</button>
+</footer>
 
 <script>
 "use strict";
@@ -473,7 +534,7 @@ function pushEvents(events) {
 // ---- the stream ---------------------------------------------------------
 
 function apply(state) {
-  drawMap(state);
+  if (!rewound) drawMap(state);
   pushEvents(state.events);
 
   const real = state.entities.filter(e => !e.is_agent);
@@ -485,6 +546,66 @@ function apply(state) {
   document.getElementById("clock").textContent = stamp(state.ts);
   handEl.classList.toggle("hidden", !(agent && agent.status === "VISIBLE"));
 }
+
+// ---- rewind -------------------------------------------------------------
+
+// The scrubber indexes the snapshot list directly. Reconstructing a past state by
+// inverting the event log is tempting and it is a trap: nothing in an event says what
+// the entities it does NOT mention were doing at the time.
+
+let snapshots = [];
+let rewound = false;
+
+const scrubEl = document.getElementById("scrub");
+const footEl  = document.getElementById("rewind");
+const bodyEl  = document.getElementById("map-body");
+
+async function pollSnapshots() {
+  try {
+    const r = await fetch("/snapshots?since=" + snapshots.length);
+    const got = await r.json();
+    if (got.snapshots.length) {
+      snapshots = snapshots.concat(got.snapshots);
+      scrubEl.max = snapshots.length;      // one past the end is "live"
+      if (!rewound) scrubEl.value = snapshots.length;
+    }
+  } catch (err) { /* the socket reports the outage already */ }
+  setTimeout(pollSnapshots, 2000);
+}
+
+function showSnapshot(i) {
+  const snap = snapshots[i];
+  if (!snap) return;
+  drawMap(snap);
+  document.getElementById("scrub-at").textContent =
+    `${i + 1}/${snapshots.length} · ${stamp(snap.ts)}`;
+
+  const img = document.getElementById("keyframe-img");
+  const name = snap.frame_ref ? snap.frame_ref.split(/[\\/]/).pop() : "";
+  img.src = name ? "/snaps/" + name : "";
+  img.style.display = name ? "block" : "none";
+  document.getElementById("keyframe-name").textContent = name || "no keyframe";
+}
+
+function goLive() {
+  rewound = false;
+  scrubEl.value = snapshots.length;
+  document.getElementById("scrub-at").textContent = "live";
+  footEl.classList.remove("rewound");
+  bodyEl.classList.remove("rewound");
+}
+
+scrubEl.addEventListener("input", () => {
+  const i = Number(scrubEl.value);
+  if (i >= snapshots.length) return goLive();
+  rewound = true;
+  footEl.classList.add("rewound");
+  bodyEl.classList.add("rewound");
+  showSnapshot(i);
+});
+
+document.getElementById("live-btn").addEventListener("click", goLive);
+pollSnapshots();
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
