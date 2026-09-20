@@ -1,3 +1,28 @@
+## linux setup guide
+setup and activate venv and install requirements
+```bash
+python -m venv venv
+. venv/bin/activate
+pip install -r requirements.txt
+```
+
+setup .env file in /yibuapi_examples_20260918_v01/.env
+```bash
+YIBU_API_KEY='your api key'
+YIBU_AUDIT_LOG='artifacts/yibu_api_calls.jsonl'
+```
+
+run calibration for camera (on first run)
+```bash
+python start.py --camera 0 --port 8080 --calibrate
+```
+
+run camera without calibration (afterwards)
+```bash
+python start.py --camera 0 --port 8080
+```
+
+```
 usage: start.py [-h] [--camera CAMERA] [--video VIDEO] [--host HOST]
                 [--port PORT] [--fake] [--speed SPEED] [--calibrate]
                 [--wake WAKE] [--chroma] [--no-embed] [--no-image]
@@ -22,3 +47,4 @@ options:
   --no-camera      world model and voice only
   --no-voice       no microphone, no Omni voice calls
   --no-browser     do not open the dashboard
+```
